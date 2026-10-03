@@ -1,0 +1,5 @@
+[tools]
+rojo = "rojo-rbx/rojo@7.7.0"
+luneblox = "XopoIII/LuneBlox@0.10.12"
+selene = "Kampfkarren/selene@0.31.0"
+stylua = "JohnnyMorganz/stylua@2.5.2"

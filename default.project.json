@@ -1,0 +1,9 @@
+{
+  "name": "Canticle",
+  "tree": {
+    "$className": "Folder",
+    "Canticle": {
+      "$path": "src"
+    }
+  }
+}
