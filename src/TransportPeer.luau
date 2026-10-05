@@ -17,6 +17,70 @@ Impl.__index = Impl
 local U32 = 4294967295
 local SEQUENCE_HALF_RANGE = math.floor(U32 / 2)
 
+type Route = {
+    id: number,
+    lane: string,
+    maximumFrameBytes: number,
+    maximumPayloadBytes: number,
+    maximumExpandedBytes: number,
+    maximumBatchItems: number,
+    maximumBatchItemBytes: number,
+    maximumOutstandingRequests: number,
+    allowBatch: boolean,
+    allowCompactBatch: boolean,
+    allowOutboundCompression: boolean,
+    schemaFingerprint: number?,
+    responseFingerprint: number?,
+    compressionPolicy: any,
+}
+type PendingRequest = { route: number, deadline: number, callback: (...any) -> ...any }
+type BatchListener = { codec: any, callback: (...any) -> ...any }
+type QueuedFrame = { raw: number, frame: buffer, carrier: string? }
+type PeerData = {
+    epoch: number,
+    routes: { [number]: Route },
+    sendReliable: (buffer) -> (),
+    sendUnreliable: ((buffer) -> ())?,
+    admit: any,
+    compressor: any,
+    compressionPolicy: any,
+    metrics: any,
+    egress: any,
+    permitOutboundCompression: boolean,
+    clock: () -> number,
+    maxRequests: number,
+    maxTimeout: number,
+    sentR: number,
+    sentU: number,
+    recvR: number,
+    recvU: number,
+    sentRoutes: { [number]: number },
+    recvRoutes: { [number]: number },
+    maximumInboundFrameBytes: number,
+    maximumQueuedBytes: number,
+    maximumQueuedFrames: number,
+    maximumReceiveFramesPerStep: number,
+    ingressPacketCapacity: number,
+    ingressPacketRefill: number,
+    ingressPacketTokens: number,
+    ingressPacketLast: number?,
+    nextRequest: number,
+    requests: { [number]: PendingRequest? },
+    requestCount: number,
+    routeRequests: { [number]: number? },
+    listeners: { [number]: (...any) -> ...any },
+    batchListeners: { [number]: BatchListener? },
+    cancelListeners: { [number]: (...any) -> ...any },
+    sending: boolean,
+    receiving: boolean,
+    receiveQueue: { [number]: QueuedFrame? },
+    receiveQueueHead: number,
+    receiveQueueTail: number,
+    receiveQueueBytes: number,
+    destroyed: boolean,
+}
+export type PeerState = typeof(setmetatable({} :: PeerData, Impl))
+
 local function isBuffer(value: any): boolean
     return typeof(value) == "buffer"
 end
@@ -41,18 +105,18 @@ local function metric(self: any, name: string, ...)
     end
 end
 
-function Peer.new(options: any): any
+function Peer.new(options: any): PeerState
     local config, err = Config.peer(options)
     assert(config, err)
     assert(type(config.sendReliable) == "function", "reliable sender required")
-    local routes = {}
+    local routes: { [number]: Route } = {}
     local maximumInboundFrameBytes = 0
     for _, route in ipairs(config.routes) do
         routes[route.id] = route
         maximumInboundFrameBytes = math.max(maximumInboundFrameBytes, route.maximumFrameBytes)
     end
-    local clock = config.clock or os.clock
-    local value = setmetatable({
+    local clock: () -> number = config.clock or os.clock
+    local data: PeerData = {
         epoch = config.epoch,
         routes = routes,
         sendReliable = config.sendReliable,
@@ -62,6 +126,7 @@ function Peer.new(options: any): any
         compressionPolicy = config.compressionPolicy,
         permitOutboundCompression = config.permitOutboundCompression == true,
         metrics = config.metrics,
+        egress = nil,
         clock = clock,
         maxRequests = config.maximumOutstandingRequests,
         maxTimeout = config.maximumRequestTimeout,
@@ -93,11 +158,12 @@ function Peer.new(options: any): any
         receiveQueueTail = 0,
         receiveQueueBytes = 0,
         destroyed = false,
-    }, Impl)
+    }
+    local value: PeerState = setmetatable(data, Impl)
     if config.egress then
         value.egress = Egress.new(config.egress, clock, function(event, bytes)
             metric(value, "egress", event, bytes)
-        end, function(reason)
+        end, function(reason: string)
             value:_terminate(reason)
         end)
     end
@@ -108,7 +174,7 @@ local function queuedFrames(self: any): number
     return math.max(0, self.receiveQueueTail - self.receiveQueueHead + 1)
 end
 
-function Impl:_drainReceiveQueue(limit: number)
+function Impl._drainReceiveQueue(self: PeerState, limit: number)
     local processed = 0
     while
         not self.destroyed
@@ -117,6 +183,10 @@ function Impl:_drainReceiveQueue(limit: number)
     do
         local head = self.receiveQueueHead
         local queued = self.receiveQueue[head]
+        if not queued then
+            self:_terminate("receive_queue_invalid")
+            break
+        end
         self.receiveQueue[head] = nil
         self.receiveQueueHead = head + 1
         self.receiveQueueBytes -= queued.raw
@@ -146,7 +216,7 @@ function Impl:_drainReceiveQueue(limit: number)
     return processed
 end
 
-function Impl:onCancel(route: number, fn: any): () -> ()
+function Impl.onCancel(self: PeerState, route: number, fn: any): () -> ()
     assert(
         not self.destroyed
             and self.routes[route]
@@ -164,7 +234,7 @@ function Impl:onCancel(route: number, fn: any): () -> ()
     end
 end
 
-function Impl:on(route: number, fn: any): () -> ()
+function Impl.on(self: PeerState, route: number, fn: any): () -> ()
     assert(not self.destroyed and self.routes[route] and type(fn) == "function", "invalid listener")
     self.listeners[route] = fn
     local live = true
@@ -176,7 +246,7 @@ function Impl:on(route: number, fn: any): () -> ()
     end
 end
 
-function Impl:onBatchValues(route: number, codec: any, fn: any): () -> ()
+function Impl.onBatchValues(self: PeerState, route: number, codec: any, fn: any): () -> ()
     local config = self.routes[route]
     assert(
         not self.destroyed
@@ -201,7 +271,8 @@ function Impl:onBatchValues(route: number, codec: any, fn: any): () -> ()
     end
 end
 
-function Impl:_finishRequest(
+function Impl._finishRequest(
+    self: PeerState,
     requestId: number,
     event: string,
     success: boolean,
@@ -221,7 +292,7 @@ function Impl:_finishRequest(
     return true
 end
 
-function Impl:_terminate(reason: string)
+function Impl._terminate(self: PeerState, reason: string)
     if self.destroyed then
         return
     end
@@ -246,7 +317,8 @@ function Impl:_terminate(reason: string)
     metric(self, "retained", 0, 0)
 end
 
-function Impl:_sendNow(
+function Impl._sendNow(
+    self: PeerState,
     route: any,
     lane: string,
     payload: buffer,
@@ -350,7 +422,8 @@ function Impl:_sendNow(
     return true, if scheduled then "queued" else nil
 end
 
-function Impl:_send(
+function Impl._send(
+    self: PeerState,
     route: any,
     lane: string,
     payload: buffer,
@@ -373,7 +446,12 @@ function Impl:_send(
     return sent, reason
 end
 
-function Impl:send(routeId: number, payload: buffer, latest: boolean?): (boolean, string?)
+function Impl.send(
+    self: PeerState,
+    routeId: number,
+    payload: buffer,
+    latest: boolean?
+): (boolean, string?)
     local route = self.routes[routeId]
     if not route or route.lane == "request" then
         return false, "invalid_route"
@@ -384,7 +462,7 @@ function Impl:send(routeId: number, payload: buffer, latest: boolean?): (boolean
     return self:_send(route, route.lane, payload, nil, false, latest)
 end
 
-function Impl:sendBatch(routeId: number, items: any): (boolean, string?)
+function Impl.sendBatch(self: PeerState, routeId: number, items: any): (boolean, string?)
     local route = self.routes[routeId]
     if
         not route
@@ -405,7 +483,12 @@ function Impl:sendBatch(routeId: number, items: any): (boolean, string?)
     return self:_send(route, route.lane, payload, nil, true, false)
 end
 
-function Impl:sendBatchValues(routeId: number, codec: any, values: any): (boolean, string?)
+function Impl.sendBatchValues(
+    self: PeerState,
+    routeId: number,
+    codec: any,
+    values: any
+): (boolean, string?)
     local route = self.routes[routeId]
     if
         not route
@@ -434,7 +517,12 @@ function Impl:sendBatchValues(routeId: number, codec: any, values: any): (boolea
     return self:_send(route, route.lane, payload, nil, true, false)
 end
 
-function Impl:sendCompactBatchValues(routeId: number, codec: any, values: any): (boolean, string?)
+function Impl.sendCompactBatchValues(
+    self: PeerState,
+    routeId: number,
+    codec: any,
+    values: any
+): (boolean, string?)
     local route = self.routes[routeId]
     if
         not route
@@ -464,7 +552,7 @@ function Impl:sendCompactBatchValues(routeId: number, codec: any, values: any): 
     return self:_send(route, route.lane, payload, nil, true, false, true)
 end
 
-function Impl:_nextRequest(): number?
+function Impl._nextRequest(self: PeerState): number?
     for _ = 1, self.maxRequests + 1 do
         self.nextRequest = if self.nextRequest >= U32 then 1 else self.nextRequest + 1
         if self.requests[self.nextRequest] == nil then
@@ -474,7 +562,8 @@ function Impl:_nextRequest(): number?
     return nil
 end
 
-function Impl:request(
+function Impl.request(
+    self: PeerState,
     routeId: number,
     payload: buffer,
     timeout: number,
@@ -523,7 +612,12 @@ function Impl:request(
     return requestId, nil
 end
 
-function Impl:respond(routeId: number, requestId: number, payload: buffer): (boolean, string?)
+function Impl.respond(
+    self: PeerState,
+    routeId: number,
+    requestId: number,
+    payload: buffer
+): (boolean, string?)
     local route = self.routes[routeId]
     if not route or route.lane ~= "request" then
         return false, "invalid_request"
@@ -531,19 +625,25 @@ function Impl:respond(routeId: number, requestId: number, payload: buffer): (boo
     return self:_send(route, "response", payload, requestId, false, false)
 end
 
-function Impl:cancel(routeId: number, requestId: number): (boolean, string?)
+function Impl.cancel(self: PeerState, routeId: number, requestId: number): (boolean, string?)
     local route = self.routes[routeId]
     if not route or route.lane ~= "request" then
         return false, "invalid_request"
     end
     local sent, err = self:_send(route, "cancel", buffer.create(0), requestId, false, false)
-    if sent and self.requests[requestId] and self.requests[requestId].route == routeId then
+    local pending = self.requests[requestId]
+    if sent and pending and pending.route == routeId then
         self:_finishRequest(requestId, "cancelled", false, nil, "cancelled")
     end
     return sent, err
 end
 
-function Impl:_expected(route: number, lane: string, sequence: number): (boolean, string?)
+function Impl._expected(
+    self: PeerState,
+    route: number,
+    lane: string,
+    sequence: number
+): (boolean, string?)
     local current = self.recvRoutes[route] or 0
     if current == 0 then
         if lane == "unreliable" or sequence == 1 then
@@ -567,7 +667,7 @@ function Impl:_expected(route: number, lane: string, sequence: number): (boolean
     return true, nil
 end
 
-function Impl:_commit(route: number, lane: string, sequence: number)
+function Impl._commit(self: PeerState, route: number, lane: string, sequence: number)
     self.recvRoutes[route] = sequence
     if lane == "unreliable" then
         self.recvU = sequence
@@ -576,7 +676,7 @@ function Impl:_commit(route: number, lane: string, sequence: number)
     end
 end
 
-function Impl:_receiveNow(frame: buffer, carrier: string?): (boolean, string?)
+function Impl._receiveNow(self: PeerState, frame: buffer, carrier: string?): (boolean, string?)
     if self.destroyed or not isBuffer(frame) then
         return false, if self.destroyed then "destroyed" else "frame_must_be_buffer"
     end
@@ -656,11 +756,8 @@ function Impl:_receiveNow(frame: buffer, carrier: string?): (boolean, string?)
         return false, "compact_batch_listener_required"
     end
     if laneIs(meta.lane, "response") then
-        if
-            not meta.requestId
-            or not self.requests[meta.requestId]
-            or self.requests[meta.requestId].route ~= meta.route
-        then
+        local pending = if meta.requestId then self.requests[meta.requestId] else nil
+        if not meta.requestId or not pending or pending.route ~= meta.route then
             metric(self, "request", "late")
             return true, "late_response"
         end
@@ -766,15 +863,12 @@ function Impl:_receiveNow(frame: buffer, carrier: string?): (boolean, string?)
     return false, "listener_failed"
 end
 
-function Impl:_admitAttempt(): (boolean, string?)
+function Impl._admitAttempt(self: PeerState): (boolean, string?)
     local ok, now = safe(self.clock)
     if not ok or not finite(now) then
         return false, "clock_failed"
     end
-    local last = self.ingressPacketLast
-    if last == nil then
-        last = now
-    end
+    local last = self.ingressPacketLast or now
     self.ingressPacketTokens = math.min(
         self.ingressPacketCapacity,
         self.ingressPacketTokens + math.max(0, now - last) * self.ingressPacketRefill
@@ -787,7 +881,7 @@ function Impl:_admitAttempt(): (boolean, string?)
     return true, nil
 end
 
-function Impl:receive(frame: any, carrier: string?): (boolean, string?)
+function Impl.receive(self: PeerState, frame: any, carrier: string?): (boolean, string?)
     if self.destroyed then
         return false, "destroyed"
     end
@@ -845,7 +939,7 @@ function Impl:receive(frame: any, carrier: string?): (boolean, string?)
     return firstAccepted, firstReason
 end
 
-function Impl:step(): number
+function Impl.step(self: PeerState): number
     if self.destroyed then
         return 0
     end
@@ -869,7 +963,7 @@ function Impl:step(): number
     end
     local expired = {}
     for requestId, pending in self.requests do
-        if pending.deadline <= now then
+        if pending and pending.deadline <= now then
             table.insert(expired, requestId)
         end
     end
@@ -879,11 +973,11 @@ function Impl:step(): number
     return #expired
 end
 
-function Impl:destroy()
+function Impl.destroy(self: PeerState)
     self:_terminate("destroyed")
 end
 
-function Impl:status(): any
+function Impl.status(self: PeerState): any
     local egress = if self.egress then self.egress:status() else { items = 0, bytes = 0 }
     return {
         destroyed = self.destroyed,

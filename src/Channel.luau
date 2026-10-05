@@ -1,5 +1,6 @@
 --!strict
 local Channel = {}
+type Codec = { fingerprint: number?, encode: (...any) -> ...any, decode: (...any) -> ...any }
 
 local function encode(codec: any, value: any): (buffer?, string?)
     if type(codec.encode) ~= "function" then
@@ -12,7 +13,7 @@ local function encode(codec: any, value: any): (buffer?, string?)
     return payload, reason
 end
 
-function Channel.bind(peer: any, routeId: number, codec: any, responseCodec: any?): any
+function Channel.bind(peer: any, routeId: number, codec: Codec, responseCodec: Codec?): any
     local route = peer.routes[routeId]
     assert(not peer.destroyed and route and type(codec) == "table", "invalid channel binding")
     assert(
@@ -44,7 +45,7 @@ function Channel.bind(peer: any, routeId: number, codec: any, responseCodec: any
         end
         return peer:sendBatchValues(routeId, codec, values)
     end
-    function handle:on(callback: any, rejected: any?): () -> ()
+    function handle:on(callback: (any, any) -> (), rejected: ((any, any) -> ())?): () -> ()
         assert(
             type(callback) == "function" and type(codec.decode) == "function",
             "channel decoder/callback required"
@@ -61,11 +62,14 @@ function Channel.bind(peer: any, routeId: number, codec: any, responseCodec: any
     function handle:onBatch(callback: any): () -> ()
         return peer:onBatchValues(routeId, codec, callback)
     end
-    function handle:request(value: any, timeout: number, callback: any): (number?, string?)
+    function handle:request(
+        value: any,
+        timeout: number,
+        callback: (boolean, any?, string?) -> ()
+    ): (number?, string?)
+        local decoder = responseCodec
         assert(
-            type(callback) == "function"
-                and responseCodec
-                and type(responseCodec.decode) == "function",
+            type(callback) == "function" and decoder and type(decoder.decode) == "function",
             "response decoder/callback required"
         )
         local payload, reason = encode(codec, value)
@@ -77,7 +81,7 @@ function Channel.bind(peer: any, routeId: number, codec: any, responseCodec: any
                 callback(false, nil, failure)
                 return
             end
-            local decoded, response, decodeReason = responseCodec:decode(bytes)
+            local decoded, response, decodeReason = decoder:decode(bytes)
             callback(decoded, response, decodeReason)
         end)
     end

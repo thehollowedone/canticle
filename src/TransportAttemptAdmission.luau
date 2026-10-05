@@ -1,6 +1,7 @@
 --!strict
 
 local AttemptAdmission = {}
+type Bucket = { packets: number, bytes: number, last: number }
 
 local function finite(value: any): boolean
     return type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge
@@ -41,7 +42,7 @@ function AttemptAdmission.new(options: any?): any
     }
     local ok, initial = pcall(clock)
     assert(ok and finite(initial), "attempt admission clock failed")
-    local peers = {}
+    local peers: { [any]: Bucket } = {}
     local global = {
         packets = globalSetting.packets.capacity,
         bytes = globalSetting.bytes.capacity,

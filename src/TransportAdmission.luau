@@ -1,6 +1,15 @@
 --!strict
 
 local Admission = {}
+type Bucket = { capacity: number, refill: number, tokens: number, last: number }
+type RouteBucket = { raw: Bucket, expanded: Bucket }
+type PeerBucket = {
+    packets: Bucket,
+    raw: Bucket,
+    expanded: Bucket,
+    routes: { [number]: RouteBucket },
+}
+type SharedBucket = { packets: Bucket, raw: Bucket, expanded: Bucket }
 
 local function finite(value: any): boolean
     return type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge
@@ -71,8 +80,8 @@ function Admission.new(options: any): any
             sharedExpanded = sharedExpanded,
             sharedPackets = sharedPackets,
         },
-        peers = {},
-        sharedRoutes = {},
+        peers = {} :: { [any]: PeerBucket },
+        sharedRoutes = {} :: { [number]: SharedBucket },
         globalRaw = makeBucket(globalRaw.capacity, globalRaw.refill, started),
         globalExpanded = makeBucket(globalExpanded.capacity, globalExpanded.refill, started),
         globalPackets = makeBucket(globalPackets.capacity, globalPackets.refill, started),
@@ -80,46 +89,46 @@ function Admission.new(options: any): any
     }
 
     function gate:_peer(id: any)
-        local peer = self.peers[id]
+        local peer: PeerBucket? = self.peers[id]
         if peer then
             return peer
         end
         local current = self.clock()
-        peer = {
+        local created: PeerBucket = {
             packets = makeBucket(packet.capacity, packet.refill, current),
             raw = makeBucket(peerRaw.capacity, peerRaw.refill, current),
             expanded = makeBucket(peerExpanded.capacity, peerExpanded.refill, current),
             routes = {},
         }
-        self.peers[id] = peer
-        return peer
+        self.peers[id] = created
+        return created
     end
 
     function gate:_route(peer: any, route: number, current: number)
-        local value = peer.routes[route]
+        local value: RouteBucket? = peer.routes[route]
         if value then
             return value
         end
-        value = {
+        local created: RouteBucket = {
             raw = makeBucket(routeRaw.capacity, routeRaw.refill, current),
             expanded = makeBucket(routeExpanded.capacity, routeExpanded.refill, current),
         }
-        peer.routes[route] = value
-        return value
+        peer.routes[route] = created
+        return created
     end
 
     function gate:_shared(route: number, current: number)
-        local value = self.sharedRoutes[route]
+        local value: SharedBucket? = self.sharedRoutes[route]
         if value then
             return value
         end
-        value = {
+        local created: SharedBucket = {
             packets = makeBucket(sharedPackets.capacity, sharedPackets.refill, current),
             raw = makeBucket(sharedRaw.capacity, sharedRaw.refill, current),
             expanded = makeBucket(sharedExpanded.capacity, sharedExpanded.refill, current),
         }
-        self.sharedRoutes[route] = value
-        return value
+        self.sharedRoutes[route] = created
+        return created
     end
 
     function gate:admit(

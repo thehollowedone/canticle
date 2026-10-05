@@ -15,6 +15,8 @@ local I32_MAX = 2147483647
 
 type Node = { [string]: any }
 type Reader = { data: buffer, offset: number, length: number }
+type BatchLimits =
+    { maximumItems: number?, maximumItemBytes: number?, maximumPayloadBytes: number? }
 
 local function finite(v: any): boolean
     return type(v) == "number" and v == v and v ~= math.huge and v ~= -math.huge
@@ -122,10 +124,11 @@ local function normalizeIntegerEncoding(
     return encoding, nil
 end
 
-local function compile(spec: any, depth: number): (Node?, string?)
-    if depth > MAX_DEPTH or type(spec) ~= "table" then
+local function compile(rawSpec: any, depth: number): (Node?, string?)
+    if depth > MAX_DEPTH or type(rawSpec) ~= "table" then
         return nil, "invalid_schema"
     end
+    local spec = rawSpec :: Node
     local kind = spec.type
     if kind == "boolean" then
         return { kind = kind, maximumBytes = 1, signature = "b" }, nil
@@ -134,8 +137,10 @@ local function compile(spec: any, depth: number): (Node?, string?)
         if width ~= "f32" and width ~= "f64" then
             return nil, "invalid_number_encoding"
         end
-        local minimum = if spec.min == nil then -math.huge else spec.min
-        local maximum = if spec.max == nil then math.huge else spec.max
+        local rawMinimum: any = spec.min
+        local rawMaximum: any = spec.max
+        local minimum: number = if rawMinimum == nil then -math.huge else rawMinimum
+        local maximum: number = if rawMaximum == nil then math.huge else rawMaximum
         if not finite(minimum) and minimum ~= -math.huge then
             return nil, "invalid_minimum"
         end
@@ -157,8 +162,8 @@ local function compile(spec: any, depth: number): (Node?, string?)
         },
             nil
     elseif kind == "integer" then
-        local minimum = spec.min
-        local maximum = spec.max
+        local minimum: number = spec.min
+        local maximum: number = spec.max
         if
             not integer(minimum)
             or not integer(maximum)
@@ -287,7 +292,8 @@ local function compile(spec: any, depth: number): (Node?, string?)
         local optionalCount = 0
         local maximumBytes = 0
         local signatures = {}
-        for index, field in ipairs(fields) do
+        for index, sourceField in ipairs(fields) do
+            local field = sourceField :: Node
             if
                 type(field) ~= "table"
                 or type(field.name) ~= "string"
@@ -714,15 +720,17 @@ end
 
 -- Compile byte-array writers once to avoid per-field dispatch.
 local function byteRecordFields(root: Node): { any }?
-    if root.kind ~= "array" or root.item.kind ~= "object" then
+    local object: Node = root.item
+    if root.kind ~= "array" or object.kind ~= "object" then
         return nil
     end
-    local object = root.item
     if object.bitmapBytes ~= 0 or #object.fields == 0 then
         return nil
     end
-    for _, field in ipairs(object.fields) do
-        if field.optional or field.node.kind ~= "integer" or field.node.encoding ~= "u8" then
+    for _, sourceField in ipairs(object.fields) do
+        local field: Node = sourceField
+        local node: Node = field.node
+        if field.optional or node.kind ~= "integer" or node.encoding ~= "u8" then
             return nil
         end
     end
@@ -1000,7 +1008,7 @@ function TransportCodec.compile(spec: any): (any?, string?)
     end
     local fingerprint = hash(root.signature)
     local codec = { fingerprint = fingerprint, maximumBytes = root.maximumBytes }
-    local byteFields = byteRecordFields(root)
+    local byteFields: { any }? = byteRecordFields(root)
     local packedBoolean = root.kind == "array" and root.packedBoolean == true
     local byteFieldsFullRange = true
     if byteFields then
@@ -1041,7 +1049,11 @@ function TransportCodec.compile(spec: any): (any?, string?)
         end
         return out, nil
     end
-    local function encodeValueBatch(values: any, limits: any?, compact: boolean): (buffer?, string?)
+    local function encodeValueBatch(
+        values: any,
+        limits: BatchLimits?,
+        compact: boolean
+    ): (buffer?, string?)
         if type(values) ~= "table" then
             return nil, "invalid_batch"
         end
@@ -1067,7 +1079,7 @@ function TransportCodec.compile(spec: any): (any?, string?)
             return nil, "invalid_batch"
         end
         local total = 2
-        local sizes = table.create(count)
+        local sizes = table.create(count) :: { number }
         local lengths = table.create(count) :: { number }
         local seen = {}
         local duplicates = {}
@@ -1115,7 +1127,10 @@ function TransportCodec.compile(spec: any): (any?, string?)
         local out = buffer.create(total)
         buffer.writeu16(out, 0, count)
         local offset = 2
-        local memo = if hasDuplicates and plainBatch(values, byteFields ~= nil) then {} else nil
+        local memo: { [any]: number }? = if hasDuplicates
+                and plainBatch(values, byteFields ~= nil)
+            then {}
+            else nil
         for i = 1, count do
             if not compact then
                 buffer.writeu32(out, offset, sizes[i])
@@ -1208,7 +1223,12 @@ function TransportCodec.compile(spec: any): (any?, string?)
         end
         return true, value, nil
     end
-    function codec:decodeBatch(data: any, limits: any?, region: any?): (boolean, any?, string?)
+    function codec:decodeBatch(
+        data: any,
+        limits: BatchLimits?,
+        region: any?
+    ): (boolean, any?, string?)
+        local fields = byteFields
         if typeof(data) ~= "buffer" or (region ~= nil and type(region) ~= "table") then
             return false, nil, "invalid_batch"
         end
@@ -1254,7 +1274,7 @@ function TransportCodec.compile(spec: any): (any?, string?)
             then
                 return false, nil, "invalid_batch_item"
             end
-            if byteFields then
+            if fields then
                 reader.length = reader.offset + size
                 local itemCount = root.maximum
                 if not root.fixed then
@@ -1267,16 +1287,11 @@ function TransportCodec.compile(spec: any): (any?, string?)
                 if itemCount < root.minimum or itemCount > root.maximum then
                     return false, nil, "invalid_array_length"
                 end
-                if reader.offset + itemCount * #byteFields ~= reader.length then
+                if reader.offset + itemCount * #fields ~= reader.length then
                     return false, nil, "invalid_batch_item"
                 end
-                local value, e = readFixedByteArray(
-                    data,
-                    reader.offset,
-                    itemCount,
-                    byteFields,
-                    byteFieldsFullRange
-                )
+                local value, e =
+                    readFixedByteArray(data, reader.offset, itemCount, fields, byteFieldsFullRange)
                 if not value then
                     return false, nil, e
                 end
@@ -1306,9 +1321,10 @@ function TransportCodec.compile(spec: any): (any?, string?)
     end
     function codec:decodeCompactBatch(
         data: any,
-        limits: any?,
+        limits: BatchLimits?,
         region: any?
     ): (boolean, any?, string?)
+        local fields = byteFields
         if typeof(data) ~= "buffer" or (region ~= nil and type(region) ~= "table") then
             return false, nil, "invalid_batch"
         end
@@ -1343,7 +1359,7 @@ function TransportCodec.compile(spec: any): (any?, string?)
         local reader = { data = data, offset = start + 2, length = finish }
         for i = 1, count do
             local itemStart = reader.offset
-            if byteFields then
+            if fields then
                 local itemCount = root.maximum
                 if not root.fixed then
                     local parsed, e = readVarUInt(reader)
@@ -1355,17 +1371,12 @@ function TransportCodec.compile(spec: any): (any?, string?)
                 if itemCount < root.minimum or itemCount > root.maximum then
                     return false, nil, "invalid_array_length"
                 end
-                local itemBytes = itemCount * #byteFields
+                local itemBytes = itemCount * #fields
                 if not need(reader, itemBytes) then
                     return false, nil, "truncated_batch"
                 end
-                local item, e = readFixedByteArray(
-                    data,
-                    reader.offset,
-                    itemCount,
-                    byteFields,
-                    byteFieldsFullRange
-                )
+                local item, e =
+                    readFixedByteArray(data, reader.offset, itemCount, fields, byteFieldsFullRange)
                 if not item then
                     return false, nil, e
                 end

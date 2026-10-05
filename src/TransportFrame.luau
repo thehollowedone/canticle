@@ -1,6 +1,8 @@
 --!strict
 
 local TransportFrame = {}
+type BatchLimits =
+    { maximumItems: number?, maximumItemBytes: number?, maximumPayloadBytes: number? }
 local MAGIC = 0x4854
 local VERSION = 2
 local HEADER = 28
@@ -218,7 +220,7 @@ function TransportFrame.decode(data: any, limits: any?): (any?, string?)
     return meta, nil
 end
 
-function TransportFrame.encodeBatch(items: any, limits: any?): (buffer?, string?)
+function TransportFrame.encodeBatch(items: any, limits: BatchLimits?): (buffer?, string?)
     if type(items) ~= "table" then
         return nil, "invalid_batch"
     end
@@ -244,7 +246,7 @@ function TransportFrame.encodeBatch(items: any, limits: any?): (buffer?, string?
     local total = 2
     for index = 1, length do
         local item = items[index]
-        if not isBuffer(item) or buffer.len(item) > maxItem then
+        if typeof(item) ~= "buffer" or buffer.len(item) > maxItem then
             return nil, "batch_item_invalid"
         end
         total += 4 + buffer.len(item)
@@ -256,7 +258,7 @@ function TransportFrame.encodeBatch(items: any, limits: any?): (buffer?, string?
     buffer.writeu16(out, 0, #items)
     local offset = 2
     for index = 1, length do
-        local item = items[index]
+        local item = items[index] :: buffer
         local n = buffer.len(item)
         buffer.writeu32(out, offset, n)
         offset += 4
@@ -268,7 +270,7 @@ function TransportFrame.encodeBatch(items: any, limits: any?): (buffer?, string?
     return out, nil
 end
 
-function TransportFrame.decodeBatch(data: any, limits: any?): ({ buffer }?, string?)
+function TransportFrame.decodeBatch(data: any, limits: BatchLimits?): ({ buffer }?, string?)
     if not isBuffer(data) or buffer.len(data) < 2 then
         return nil, "invalid_batch"
     end
@@ -282,7 +284,7 @@ function TransportFrame.decodeBatch(data: any, limits: any?): ({ buffer }?, stri
         return nil, "batch_item_count"
     end
     local offset = 2
-    local out = table.create(count)
+    local out = table.create(count) :: { buffer }
     for i = 1, count do
         if offset > buffer.len(data) - 4 then
             return nil, "truncated_batch"

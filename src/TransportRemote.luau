@@ -1,6 +1,7 @@
 --!strict
 
 local Peer = if script then require(script.Parent.TransportPeer) else require("./TransportPeer")
+type PeerState = typeof(Peer.new({}))
 local Manifest = if script
     then require(script.Parent.TransportManifest)
     else require("./TransportManifest")
@@ -8,6 +9,8 @@ local Admission = if script
     then require(script.Parent.TransportAdmission)
     else require("./TransportAdmission")
 local Remote = {}
+type Session = { challenge: number, epoch: number, active: boolean }
+type Creation = { session: Session }
 local U32 = 4294967295
 local ADAPTER_EVENTS = {
     handshake_denied = 0,
@@ -186,8 +189,9 @@ function Remote.client(
             peer:step()
         end
     end)
-    if type(options.bindPeer) == "function" then
-        local bound = pcall(options.bindPeer, peer)
+    local bindPeer: ((PeerState) -> ())? = options.bindPeer
+    if type(bindPeer) == "function" then
+        local bound = pcall(bindPeer, peer)
         if not bound or peer:status().destroyed then
             observe(metrics, nil, "peer_creation_failed")
             disconnect(handshakeConnection)
@@ -251,9 +255,9 @@ function Remote.server(
     assert(handshake ~= nil, "transport handshake remote required")
     local advertised = settings.manifest
     assert(type(advertised) == "table", "transport manifest required")
-    local peers = {}
-    local sessions = {}
-    local creations = {}
+    local peers: { [Player]: PeerState? } = {}
+    local sessions: { [Player]: Session? } = {}
+    local creations: { [Player]: Creation? } = {}
     local attemptWindows = {}
     local replacementWindows = {}
     local state = "OPEN"
@@ -263,7 +267,7 @@ function Remote.server(
         settings.admission == nil or type(settings.admission) == "table",
         "invalid admission options"
     )
-    local admissionOptions = table.clone(settings.admission or {})
+    local admissionOptions = table.clone((settings.admission or {}) :: { [string]: any })
     admissionOptions.clock = admissionOptions.clock or clock
     local admission = Admission.new(admissionOptions)
     local windowSeconds = settings.handshakeAttemptWindowSeconds or 10
@@ -307,7 +311,7 @@ function Remote.server(
         end
     end
 
-    local function create(player: Player, epoch: number, token: any): any
+    local function create(player: Player, epoch: number, token: Creation): PeerState?
         local called, supplied = pcall(optionsFor, player)
         if
             not called
@@ -322,7 +326,7 @@ function Remote.server(
             return nil
         end
         local config = table.clone(supplied)
-        local suppliedAdmit = config.admit
+        local suppliedAdmit: ((number, number, number) -> (boolean, string?))? = config.admit
         config.admit = function(route, rawBytes, expandedBytes)
             local admitted, reason = admission:admit(player, route, rawBytes, expandedBytes)
             if not admitted then
@@ -354,7 +358,8 @@ function Remote.server(
                 error("transport peer is not ready")
             end
         end
-        if unreliable then
+        local unreliableRemote = unreliable
+        if unreliableRemote then
             config.sendUnreliable = function(frame)
                 if
                     state == "OPEN"
@@ -362,7 +367,7 @@ function Remote.server(
                     and sessions[player] == token.session
                     and token.session.active
                 then
-                    unreliable:FireClient(player, frame)
+                    unreliableRemote:FireClient(player, frame)
                 else
                     observe(metrics, adapterEvents, "pre_ready_frame_rejected")
                     error("transport peer is not ready")
@@ -426,7 +431,9 @@ function Remote.server(
         end
         local expired = 0
         for _, peer in peers do
-            expired += peer:step()
+            if peer then
+                expired += peer:step()
+            end
         end
         return expired
     end
@@ -583,7 +590,9 @@ function Remote.server(
         table.clear(replacementWindows)
         for player, peer in peers do
             peers[player] = nil
-            peer:destroy()
+            if peer then
+                peer:destroy()
+            end
         end
         admission:close()
         state = "CLOSED"

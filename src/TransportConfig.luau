@@ -70,7 +70,7 @@ function Config.routes(raw: any): ({ any }?, string?)
     if not denseArray(raw) or #raw < 1 or #raw > 256 then
         return nil, "invalid_routes"
     end
-    local out = {}
+    local out: { any } = {}
     local ids = {}
     for index, route in ipairs(raw) do
         if type(route) ~= "table" or not integer(route.id, 1, 65535) or ids[route.id] then

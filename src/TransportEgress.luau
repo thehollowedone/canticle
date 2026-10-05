@@ -1,6 +1,14 @@
 --!strict
 
 local Egress = {}
+type Entry = {
+    key: any,
+    frame: buffer,
+    size: number,
+    enqueuedAt: number,
+    emit: (buffer) -> (),
+    reliable: boolean,
+}
 
 local function finite(value: any): boolean
     return type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge
@@ -46,10 +54,10 @@ end
 function Egress.new(options: any, clock: () -> number, onEvent: any, onFailure: any): any
     local limits, err = Egress.validate(options)
     assert(limits, err)
-    local queues = { latest = {}, bulk = {} }
+    local queues: { [string]: { [number]: Entry? } } = { latest = {}, bulk = {} }
     local heads = { latest = 1, bulk = 1 }
     local tails = { latest = 0, bulk = 0 }
-    local latestByKey = {}
+    local latestByKey: { [any]: Entry? } = {}
     local count = 0
     local bytes = 0
     local closed = false
