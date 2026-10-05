@@ -29,10 +29,13 @@ See the [API guide](docs/api.md) for routes, live remotes, batching, and cleanup
 Install the tools pinned in `rokit.toml`, then:
 
 ```powershell
+python tools/check-types.py
 luneblox run tests/run.luau
 rojo build default.project.json -o build/Canticle.rbxm
 ```
 
 `src/` contains the runtime, `tools/` the codec generators, and `tests/` the tests.
+Type analysis covers every runtime and generator module with both Luau solvers
+under default and enabled flags.
 
 [MIT license](LICENSE).

@@ -61,12 +61,13 @@ function AttemptAdmission.new(options: any?): any
         end
         local bucket = peers[peer]
         if not bucket then
-            bucket = {
+            local created: Bucket = {
                 packets = peerSetting.packets.capacity,
                 bytes = peerSetting.bytes.capacity,
                 last = now,
             }
-            peers[peer] = bucket
+            peers[peer] = created
+            bucket = created
         end
         refill(bucket, peerSetting, now)
         refill(global, globalSetting, now)

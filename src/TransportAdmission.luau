@@ -10,6 +10,7 @@ type PeerBucket = {
     routes: { [number]: RouteBucket },
 }
 type SharedBucket = { packets: Bucket, raw: Bucket, expanded: Bucket }
+type Spec = { capacity: number, refill: number }
 
 local function finite(value: any): boolean
     return type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge
@@ -19,17 +20,23 @@ local function finiteInteger(value: any, minimum: number): boolean
     return finite(value) and value == math.floor(value) and value >= minimum
 end
 
-local function makeBucket(capacity: number, refill: number, now: number)
+local function makeBucket(capacity: number, refill: number, now: number): Bucket
     return { capacity = capacity, refill = refill, tokens = capacity, last = now }
 end
 
-local function refresh(bucket: any, now: number)
+local function refresh(bucket: Bucket, now: number)
     bucket.tokens =
         math.min(bucket.capacity, bucket.tokens + math.max(0, now - bucket.last) * bucket.refill)
     bucket.last = math.max(bucket.last, now)
 end
 
-local function readSpec(options: any, name: string, fallback: any, capacity: number, refill: number)
+local function readSpec(
+    options: any,
+    name: string,
+    fallback: any,
+    capacity: number,
+    refill: number
+): Spec
     local value = options[name] or fallback or {}
     local cap = value.capacity or capacity
     local rate = value.refillPerSecond or refill
