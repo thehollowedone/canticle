@@ -29,7 +29,7 @@ See the [API guide](docs/api.md) for routes, live remotes, batching, and cleanup
 Install the tools pinned in `rokit.toml`, then:
 
 ```powershell
-python tools/check-types.py
+powershell -NoProfile -File tools/check-types.ps1
 luneblox run tests/run.luau
 rojo build default.project.json -o build/Canticle.rbxm
 ```
