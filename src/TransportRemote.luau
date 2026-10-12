@@ -86,10 +86,46 @@ function Remote.client(
     local challenge = options.handshakeChallenge or math.random(1, 2147483647)
     assert(integer(challenge, 1, U32), "transport handshake challenge must be a nonzero u32")
     local metrics = options.metrics
+    local attempts = options.maximumHandshakeAttempts or 10
+    assert(integer(attempts, 1, 100), "invalid handshake attempt limit")
+    local stepSignal = options.stepSignal or defaultHeartbeat()
+    local initializationOwner: thread? = coroutine.running()
     local epoch: number? = nil
     local confirmed = false
     local state = "OPEN"
-    local handshakeConnection = handshake.OnClientEvent:Connect(function(...)
+    local peer: any = nil
+    local handshakeConnection: any = nil
+    local reliableConnection: any = nil
+    local unreliableConnection: any = nil
+    local stepConnection: any = nil
+    local function close()
+        if state ~= "OPEN" then
+            return
+        end
+        state = "CLOSED"
+        initializationOwner = nil
+        disconnect(handshakeConnection)
+        disconnect(reliableConnection)
+        disconnect(unreliableConnection)
+        disconnect(stepConnection)
+        if peer then
+            peer:destroy()
+        end
+    end
+    -- The caller cannot return a disposer if initialization is cancelled.
+    -- Reuse normal lifecycle stepping to release that abandoned ownership.
+    stepConnection = connect(stepSignal, function()
+        if state ~= "OPEN" then
+            return
+        end
+        local owner = initializationOwner
+        if owner and coroutine.status(owner) == "dead" then
+            close()
+        elseif peer then
+            peer:step()
+        end
+    end)
+    handshakeConnection = handshake.OnClientEvent:Connect(function(...)
         if state ~= "OPEN" then
             return
         end
@@ -124,8 +160,6 @@ function Remote.client(
                 task.wait(0.5)
             end
         end
-    local attempts = options.maximumHandshakeAttempts or 10
-    assert(integer(attempts, 1, 100), "invalid handshake attempt limit")
     for _ = 1, attempts do
         if epoch ~= nil then
             break
@@ -137,14 +171,12 @@ function Remote.client(
     end
     if epoch == nil then
         observe(metrics, nil, "handshake_denied")
-        disconnect(handshakeConnection)
-        state = "CLOSED"
+        close()
         error("transport handshake failed")
     end
 
     local config = table.clone(options)
     config.epoch = epoch
-    local stepSignal = config.stepSignal or defaultHeartbeat()
     config.sendReliable = function(frame)
         if not confirmed then
             observe(metrics, nil, "pre_ready_frame_rejected")
@@ -161,21 +193,21 @@ function Remote.client(
             unreliable:FireServer(frame)
         end
     end
-    local made, peer = pcall(Peer.new, config)
+    local made, result = pcall(Peer.new, config)
     if not made then
         observe(metrics, nil, "peer_creation_failed")
-        disconnect(handshakeConnection)
-        state = "CLOSED"
-        error("transport peer creation failed: " .. tostring(peer))
+        close()
+        error("transport peer creation failed: " .. tostring(result))
     end
-    local reliableConnection = reliable.OnClientEvent:Connect(function(frame)
+    peer = result
+    reliableConnection = reliable.OnClientEvent:Connect(function(frame)
         if state == "OPEN" and confirmed then
             peer:receive(frame, "reliable")
         elseif state == "OPEN" then
             observe(metrics, nil, "pre_ready_frame_rejected")
         end
     end)
-    local unreliableConnection = if unreliable
+    unreliableConnection = if unreliable
         then unreliable.OnClientEvent:Connect(function(frame)
             if state == "OPEN" and confirmed then
                 peer:receive(frame, "unreliable")
@@ -184,22 +216,12 @@ function Remote.client(
             end
         end)
         else nil
-    local stepConnection = connect(stepSignal, function()
-        if state == "OPEN" then
-            peer:step()
-        end
-    end)
     local bindPeer: ((PeerState) -> ())? = options.bindPeer
     if type(bindPeer) == "function" then
         local bound = pcall(bindPeer, peer)
         if not bound or peer:status().destroyed then
             observe(metrics, nil, "peer_creation_failed")
-            disconnect(handshakeConnection)
-            disconnect(reliableConnection)
-            disconnect(unreliableConnection)
-            disconnect(stepConnection)
-            peer:destroy()
-            state = "CLOSED"
+            close()
             error("transport client peer binding failed")
         end
     end
@@ -220,28 +242,14 @@ function Remote.client(
         end
     end
     disconnect(handshakeConnection)
+    handshakeConnection = nil
     if not confirmed then
         observe(metrics, nil, "handshake_denied")
-        state = "DRAINING"
-        disconnect(reliableConnection)
-        disconnect(unreliableConnection)
-        disconnect(stepConnection)
-        peer:destroy()
-        state = "CLOSED"
+        close()
         error("transport handshake confirmation failed")
     end
-    return peer,
-        function()
-            if state ~= "OPEN" then
-                return
-            end
-            state = "DRAINING"
-            disconnect(reliableConnection)
-            disconnect(unreliableConnection)
-            disconnect(stepConnection)
-            peer:destroy()
-            state = "CLOSED"
-        end
+    initializationOwner = nil
+    return peer, close
 end
 
 function Remote.server(

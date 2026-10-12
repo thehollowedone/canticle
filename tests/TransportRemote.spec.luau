@@ -25,6 +25,9 @@ local function signal()
             handler(...)
         end
     end
+    function value:Count()
+        return #handlers
+    end
     return value
 end
 
@@ -355,6 +358,101 @@ return function()
     assert(
         boundedAdapter.other == 1 and boundedAdapter.unrecognized == nil,
         "adapter metrics must collapse unknown labels into one fixed bucket"
+    )
+
+    for _, phase in { "offer", "binding", "ready" } do
+        local abandonedReliable = { OnClientEvent = signal() }
+        function abandonedReliable:FireServer() end
+        local abandonedUnreliable = { OnClientEvent = signal() }
+        function abandonedUnreliable:FireServer() end
+        local abandonedHandshake = { OnClientEvent = signal() }
+        function abandonedHandshake:FireServer(challenge, version, fingerprint, ready)
+            if phase ~= "offer" and ready == nil then
+                self.OnClientEvent:Fire(challenge, 999, version, fingerprint, "offer")
+            end
+        end
+        local abandonedHeartbeat = signal()
+        local boundPeer
+        local initializing = coroutine.create(function()
+            Transport.Remote.client(abandonedReliable, abandonedUnreliable, {
+                routes = routes,
+                manifest = manifest,
+                handshakeRemote = abandonedHandshake,
+                handshakeChallenge = 902,
+                maximumHandshakeAttempts = 1,
+                handshakeWait = function()
+                    coroutine.yield()
+                end,
+                stepSignal = abandonedHeartbeat,
+                bindPeer = function(peer)
+                    boundPeer = peer
+                    if phase == "binding" then
+                        coroutine.yield()
+                    end
+                end,
+            })
+        end)
+        assert(coroutine.resume(initializing), "client fixture must suspend during " .. phase)
+        assert(
+            coroutine.status(initializing) == "suspended",
+            "initialization must remain in flight"
+        )
+        assert(coroutine.close(initializing), "caller cancellation fixture must close")
+        abandonedHeartbeat:Fire()
+        assert(
+            abandonedHandshake.OnClientEvent:Count() == 0
+                and abandonedReliable.OnClientEvent:Count() == 0
+                and abandonedUnreliable.OnClientEvent:Count() == 0
+                and abandonedHeartbeat:Count() == 0,
+            "cancelled client initialization must release every adapter connection during " .. phase
+        )
+        assert(
+            not boundPeer or boundPeer:status().destroyed,
+            "cancelled binding must destroy its peer"
+        )
+        abandonedHeartbeat:Fire()
+    end
+
+    local completedReliable = { OnClientEvent = signal() }
+    function completedReliable:FireServer() end
+    local completedHandshake = { OnClientEvent = signal() }
+    function completedHandshake:FireServer(challenge, version, fingerprint, phase)
+        self.OnClientEvent:Fire(challenge, 1000, version, fingerprint, phase or "offer")
+    end
+    local completedHeartbeat = signal()
+    local completedPeer, completedClose
+    local completedOwner = coroutine.create(function()
+        completedPeer, completedClose = Transport.Remote.client(completedReliable, nil, {
+            routes = routes,
+            manifest = manifest,
+            handshakeRemote = completedHandshake,
+            handshakeChallenge = 903,
+            stepSignal = completedHeartbeat,
+        })
+    end)
+    assert(coroutine.resume(completedOwner), "successful caller must return its peer")
+    assert(coroutine.status(completedOwner) == "dead", "completed setup caller has finished")
+    completedHeartbeat:Fire()
+    assert(
+        not completedPeer:status().destroyed and completedHeartbeat:Count() == 1,
+        "a completed initialization transfers ownership instead of abandoning the live peer"
+    )
+    completedClose()
+    assert(completedHeartbeat:Count() == 0 and completedReliable.OnClientEvent:Count() == 0)
+
+    local invalidHandshake = { OnClientEvent = signal() }
+    local invalidCreated = pcall(Transport.Remote.client, completedReliable, nil, {
+        routes = routes,
+        manifest = manifest,
+        handshakeRemote = invalidHandshake,
+        maximumHandshakeAttempts = 0,
+        stepSignal = completedHeartbeat,
+    })
+    assert(
+        not invalidCreated
+            and invalidHandshake.OnClientEvent:Count() == 0
+            and completedHeartbeat:Count() == 0,
+        "invalid initialization options must fail before any lifecycle connection is attached"
     )
 
     local raceReliable = { OnClientEvent = signal(), OnServerEvent = signal() }
