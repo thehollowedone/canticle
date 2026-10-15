@@ -163,7 +163,10 @@ terminal notifications.
 Request settlement, metrics, and terminal callbacks must not yield; yielding
 callbacks are cancelled. Teardown releases retained state before notifying the
 adapter or settling pending requests. Receive listeners keep their existing
-yielding behavior.
+yielding behavior while the peer is live. On retirement, suspended receives
+(including queued listeners and decoders) are cancelled so their waiting stacks
+and payloads cannot outlive the peer. The waiting caller resumes with `false, terminalReason` so its cleanup can run.
+Cancelling the caller retires its worker on the next `step()` or peer teardown.
 
 ## Reliable capacity and admission sizing
 

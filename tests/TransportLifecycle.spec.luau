@@ -323,9 +323,8 @@ return function()
     local started, decodingMarker = coroutine.resume(decodingThread)
     assert(started and decodingMarker == "decoding", "decoder must suspend inside receive")
     decodingPeer:destroy()
-    local finished, accepted, retiredReason = coroutine.resume(decodingThread)
     assert(
-        finished and not accepted and retiredReason == "destroyed" and retiredCalls == 0,
-        "retired decoder completion must not dispatch application callbacks"
+        coroutine.status(decodingThread) == "dead" and retiredCalls == 0,
+        "destroy must close a suspended decoder instead of retaining its frame"
     )
 end

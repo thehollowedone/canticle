@@ -217,7 +217,10 @@ return function()
             s:step()
         end)
         assert(coroutine.resume(co))
-        assert(held == co)
+        assert(
+            held ~= co and coroutine.status(held) == "suspended",
+            "listener must have its own worker"
+        )
         for _ = 1, 6 do
             local before = seen[1] + seen[2] + seen[3]
             s:step()

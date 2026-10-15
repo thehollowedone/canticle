@@ -1,4 +1,6 @@
 local suites = {
+    require("./TransportMemoryScheduler.spec"),
+    require("./TransportMemoryLifecycle.spec"),
     require("./TransportRecoveryReview.spec"),
     require("./TransportRecovery.spec"),
     require("./TransportCodec.spec"),

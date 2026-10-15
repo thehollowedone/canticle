@@ -77,6 +77,7 @@ type PeerData = {
     cancelListeners: { [number]: (...any) -> ...any },
     sending: boolean,
     receiving: boolean,
+    receiveOperation: any,
     receiveQueue: { [number]: QueuedFrame? },
     receiveQueueHead: number,
     receiveQueueTail: number,
@@ -166,6 +167,7 @@ function Peer.new(options: any): PeerState
         cancelListeners = {},
         sending = false,
         receiving = false,
+        receiveOperation = nil,
         receiveQueue = {},
         receiveQueueHead = 1,
         receiveQueueTail = 0,
@@ -326,12 +328,86 @@ function Impl._finishRequest(
     return true
 end
 
+-- Each active receive has one library-owned worker and one waiting caller.
+-- Preserve synchronous/yielding results without owning the caller's later work.
+function Impl._runReceive(self: PeerState, callback: () -> (boolean, string?)): (boolean, string?)
+    local operation: any = {
+        waiter = coroutine.running(),
+        waiting = false,
+        driving = true,
+        result = nil,
+    }
+    self.receiveOperation = operation
+    self.receiving = true
+    local function complete(...)
+        if operation.result then
+            return
+        end
+        operation.result = table.pack(...)
+        if self.receiveOperation == operation then
+            self.receiveOperation = nil
+            self.receiving = false
+        end
+        if operation.waiting and not operation.driving then
+            local waiter = operation.waiter
+            local function wake()
+                if coroutine.status(waiter) == "suspended" then
+                    coroutine.resume(waiter)
+                end
+            end
+            if script then
+                task.defer(wake)
+            else
+                wake()
+            end
+        end
+    end
+    operation.complete = complete
+    local worker = coroutine.create(function()
+        local result = table.pack(pcall(callback))
+        if result[1] then
+            complete(table.unpack(result, 2, result.n))
+        else
+            self:_terminate("receive_failed")
+        end
+    end)
+    operation.worker = worker
+    local yielded = table.pack(coroutine.resume(worker))
+    operation.driving = false
+    while not operation.result do
+        if not yielded[1] then
+            self:_terminate("receive_failed")
+            break
+        end
+        operation.waiting = true
+        local resumed = table.pack(coroutine.yield(table.unpack(yielded, 2, yielded.n)))
+        operation.waiting = false
+        if not operation.result then
+            operation.driving = true
+            yielded = table.pack(coroutine.resume(worker, table.unpack(resumed, 1, resumed.n)))
+            operation.driving = false
+        end
+    end
+    -- Self-termination may occur before the worker yields back to this driver.
+    -- Closing only the library worker leaves caller cleanup free to run.
+    if self.destroyed then
+        Callbacks.cancel(worker)
+    end
+    return table.unpack(operation.result, 1, operation.result.n)
+end
+
 function Impl._terminate(self: PeerState, reason: string)
     if self.destroyed then
         return
     end
     self.destroyed = true
     self.terminalReason = reason
+    local operation = self.receiveOperation
+    self.receiveOperation = nil
+    self.receiving = false
+    if operation then
+        Callbacks.cancel(operation.worker)
+    end
     -- Release all ownership before notifications or request settlement callbacks.
     local pending = self.requests
     self.requests = {}
@@ -358,6 +434,9 @@ function Impl._terminate(self: PeerState, reason: string)
             metric(self, "request", "cancelled")
             Callbacks.synchronous(request.callback, false, nil, reason)
         end
+    end
+    if operation then
+        operation.complete(false, reason)
     end
 end
 
@@ -985,26 +1064,30 @@ function Impl.receive(self: PeerState, frame: any, carrier: string?): (boolean, 
         if self.receiving then
             return true, "queued"
         end
-        self.receiving = true
-        self:_drainReceiveQueue(self.maximumReceiveFramesPerStep)
-        self.receiving = false
-        return true, "queued"
+        return self:_runReceive(function()
+            self:_drainReceiveQueue(self.maximumReceiveFramesPerStep)
+            return true, "queued"
+        end)
     end
 
-    self.receiving = true
-    self.receiveRemaining -= 1
-    local called, accepted, reason = safe(self._receiveNow, self, frame, carrier)
-    local firstAccepted = if called then accepted else false
-    local firstReason = if called then reason else "receive_failed"
-    self:_drainReceiveQueue(math.max(0, self.maximumReceiveFramesPerStep - 1))
-    self.receiving = false
-    if not called then
-        self:_terminate("receive_failed")
-    end
-    return firstAccepted, firstReason
+    return self:_runReceive(function()
+        self.receiveRemaining -= 1
+        local called, accepted, reason = safe(self._receiveNow, self, frame, carrier)
+        local firstAccepted = if called then accepted else false
+        local firstReason = if called then reason else "receive_failed"
+        self:_drainReceiveQueue(math.max(0, self.maximumReceiveFramesPerStep - 1))
+        if not called then
+            self:_terminate("receive_failed")
+        end
+        return firstAccepted, firstReason
+    end)
 end
 
 function Impl.step(self: PeerState): number
+    local operation = self.receiveOperation
+    if operation and coroutine.status(operation.waiter) == "dead" then
+        self:_terminate("receive_caller_cancelled")
+    end
     if self.destroyed then
         return 0
     end
@@ -1019,9 +1102,10 @@ function Impl.step(self: PeerState): number
         return 0
     end
     if not self.receiving and queuedFrames(self) > 0 then
-        self.receiving = true
-        self:_drainReceiveQueue(self.maximumReceiveFramesPerStep)
-        self.receiving = false
+        self:_runReceive(function()
+            self:_drainReceiveQueue(self.maximumReceiveFramesPerStep)
+            return true, "queued"
+        end)
     end
     if self.destroyed or self.requestCount == 0 then
         return 0
