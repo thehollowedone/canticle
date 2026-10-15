@@ -42,6 +42,7 @@ local ADAPTER_EVENTS = {
     handshake_mismatch = true,
     session_replaced = true,
     peer_creation_failed = true,
+    peer_terminated = true,
     pre_ready_frame_rejected = true,
     other = true,
 }
@@ -109,6 +110,7 @@ function Metrics.new(): any
             handshake_mismatch = 0,
             session_replaced = 0,
             peer_creation_failed = 0,
+            peer_terminated = 0,
             pre_ready_frame_rejected = 0,
             other = 0,
         },

@@ -599,7 +599,7 @@ return function()
     end)
     assert(
         coroutine.resume(replacing) and departureEntered,
-        "replacement must suspend in old cleanup"
+        "replacement must settle old callbacks without suspension"
     )
     departureHandshake.OnServerEvent:Fire(player, 702, manifest.version, manifest.fingerprint)
     departureHandshake.OnServerEvent:Fire(
@@ -610,11 +610,11 @@ return function()
         "ready"
     )
     local newestPeer = departureServer:findPeer(player)
-    assert(coroutine.resume(replacing), "stale replacement must finish its own cleanup")
     assert(
-        #offers == 2 and offers[2] == 702,
-        "stale replacement must not emit an offer after a newer generation owns the player"
+        coroutine.status(replacing) == "dead",
+        "yielding settlement must not suspend replacement"
     )
+    assert(#offers == 3 and offers[3] == 702, "each completed replacement must emit its own offer")
     assert(
         newestPeer
             and departureServer:findPeer(player) == newestPeer
@@ -625,12 +625,12 @@ return function()
         newestPeer:request(2, bytes("epoch pending"), 1, function()
             coroutine.yield()
         end),
-        "epoch fixture must suspend replacement cleanup"
+        "epoch fixture must attempt to yield during cleanup"
     )
     local epochReplacement = coroutine.create(function()
         departureHandshake.OnServerEvent:Fire(player, 710, manifest.version, manifest.fingerprint)
     end)
-    assert(coroutine.resume(epochReplacement), "replacement epoch must reserve before yielding")
+    assert(coroutine.resume(epochReplacement), "replacement epoch must be reserved independently")
     local otherPlayer = { UserId = 78 }
     departureHandshake.OnServerEvent:Fire(otherPlayer, 800, manifest.version, manifest.fingerprint)
     departureHandshake.OnServerEvent:Fire(
@@ -641,7 +641,7 @@ return function()
         "ready"
     )
     assert(
-        coroutine.resume(epochReplacement),
+        coroutine.status(epochReplacement) == "dead",
         "another player's epoch must not alter the reservation"
     )
     departureHandshake.OnServerEvent:Fire(
@@ -666,7 +666,7 @@ return function()
     local removing = coroutine.create(function()
         departureServer:removePeer(player)
     end)
-    assert(coroutine.resume(removing), "player removal must suspend in cleanup")
+    assert(coroutine.resume(removing), "player removal must complete despite yielding cleanup")
     departureHandshake.OnServerEvent:Fire(player, 703, manifest.version, manifest.fingerprint)
     departureHandshake.OnServerEvent:Fire(
         player,
@@ -676,7 +676,7 @@ return function()
         "ready"
     )
     local rejoinedPeer = departureServer:findPeer(player)
-    assert(coroutine.resume(removing), "retired player removal must finish its own cleanup")
+    assert(coroutine.status(removing) == "dead", "retired cleanup must not retain player removal")
     assert(
         rejoinedPeer
             and departureServer:findPeer(player) == rejoinedPeer
@@ -693,10 +693,13 @@ return function()
     local shuttingDown = coroutine.create(function()
         departureHandshake.OnServerEvent:Fire(player, 704, manifest.version, manifest.fingerprint)
     end)
-    assert(coroutine.resume(shuttingDown), "shutdown replacement must suspend in cleanup")
+    assert(
+        coroutine.resume(shuttingDown),
+        "shutdown replacement must complete despite yielding cleanup"
+    )
     local offerCount = #offers
     departureServer:destroy()
-    assert(coroutine.resume(shuttingDown), "shutdown must invalidate the suspended replacement")
+    assert(coroutine.status(shuttingDown) == "dead", "shutdown must not retain replacement cleanup")
     assert(
         #offers == offerCount
             and departureServer:findPeer(player) == nil

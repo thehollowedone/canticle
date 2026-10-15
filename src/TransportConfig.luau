@@ -223,6 +223,25 @@ function Config.peer(options: any): (any?, string?)
     local maximumQueuedReceiveBytes = options.maximumQueuedReceiveBytes or 1024 * 1024
     local maximumQueuedFrames = options.maximumQueuedFrames or 256
     local maximumReceiveFramesPerStep = options.maximumReceiveFramesPerStep or 32
+    if
+        not integer(maximumQueuedFrames, 1, 4096)
+        or not integer(maximumQueuedReceiveBytes, 1, 16 * 1024 * 1024)
+    then
+        return nil, "invalid_peer_limits"
+    end
+    local queueReserve = options.receiveQueueReliableReserve or {}
+    if type(queueReserve) ~= "table" then
+        return nil, "invalid_peer_limits"
+    end
+    local largestReliableFrame = 0
+    for _, route in ipairs(routes) do
+        if route.lane ~= "unreliable" then
+            largestReliableFrame = math.max(largestReliableFrame, route.maximumFrameBytes)
+        end
+    end
+    local reserveFrames = queueReserve.frames or math.min(8, math.ceil(maximumQueuedFrames / 4))
+    local reserveBytes = queueReserve.bytes
+        or math.min(maximumQueuedReceiveBytes, largestReliableFrame)
     local ingressPackets = options.ingressPackets or {}
     if type(ingressPackets) ~= "table" then
         return nil, "invalid_peer_limits"
@@ -230,7 +249,21 @@ function Config.peer(options: any): (any?, string?)
     local ingressPacketCapacity = ingressPackets.capacity or 256
     local ingressPacketRefill = ingressPackets.refillPerSecond or 128
     if
-        not integer(maximumRequests, 1, 1024)
+        not finite(ingressPacketCapacity)
+        or ingressPacketCapacity <= 0
+        or ingressPacketCapacity > 100000
+    then
+        return nil, "invalid_peer_limits"
+    end
+    local ingressReliableReserve = options.ingressReliableReserve
+    if ingressReliableReserve == nil then
+        ingressReliableReserve = math.min(16, math.floor(ingressPacketCapacity / 4))
+    end
+    if
+        not integer(reserveFrames, 0, maximumQueuedFrames)
+        or not integer(reserveBytes, 0, maximumQueuedReceiveBytes)
+        or not integer(ingressReliableReserve, 0, ingressPacketCapacity - 1)
+        or not integer(maximumRequests, 1, 1024)
         or not finite(maximumTimeout)
         or maximumTimeout <= 0
         or maximumTimeout > 300
@@ -253,6 +286,9 @@ function Config.peer(options: any): (any?, string?)
     copy.maximumQueuedReceiveBytes = maximumQueuedReceiveBytes
     copy.maximumQueuedFrames = maximumQueuedFrames
     copy.maximumReceiveFramesPerStep = maximumReceiveFramesPerStep
+    copy.receiveQueueReliableReserve =
+        table.freeze({ frames = reserveFrames, bytes = reserveBytes })
+    copy.ingressReliableReserve = ingressReliableReserve
     copy.ingressPackets = table.freeze({
         capacity = ingressPacketCapacity,
         refillPerSecond = ingressPacketRefill,

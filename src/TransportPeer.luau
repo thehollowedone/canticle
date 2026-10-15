@@ -11,6 +11,10 @@ local Egress = if script
     then require(script.Parent.TransportEgress)
     else require("./TransportEgress")
 
+local Callbacks = if script
+    then require(script.Parent.TransportCallbacks)
+    else require("./TransportCallbacks")
+
 local Peer = {}
 local Impl = {}
 Impl.__index = Impl
@@ -78,6 +82,15 @@ type PeerData = {
     receiveQueueTail: number,
     receiveQueueBytes: number,
     destroyed: boolean,
+    queuedUnreliableFrames: number,
+    queuedUnreliableBytes: number,
+    reserveQueueFrames: number,
+    reserveQueueBytes: number,
+    terminalReason: string?,
+    onTerminate: any,
+    receiveRemaining: number,
+    acquireReceiveWork: (() -> boolean)?,
+    ingressReliableReserve: number,
 }
 export type PeerState = typeof(setmetatable({} :: PeerData, Impl))
 
@@ -101,7 +114,7 @@ local function metric(self: any, name: string, ...)
     local metrics = self.metrics
     local fn = metrics and metrics[name]
     if type(fn) == "function" then
-        pcall(fn, metrics, ...)
+        Callbacks.synchronous(fn, metrics, ...)
     end
 end
 
@@ -158,6 +171,15 @@ function Peer.new(options: any): PeerState
         receiveQueueTail = 0,
         receiveQueueBytes = 0,
         destroyed = false,
+        queuedUnreliableFrames = 0,
+        queuedUnreliableBytes = 0,
+        reserveQueueFrames = config.receiveQueueReliableReserve.frames,
+        reserveQueueBytes = config.receiveQueueReliableReserve.bytes,
+        terminalReason = nil,
+        onTerminate = config.onTerminate,
+        receiveRemaining = config.maximumReceiveFramesPerStep,
+        acquireReceiveWork = config.acquireReceiveWork,
+        ingressReliableReserve = config.ingressReliableReserve,
     }
     local value: PeerState = setmetatable(data, Impl)
     if config.egress then
@@ -179,8 +201,13 @@ function Impl._drainReceiveQueue(self: PeerState, limit: number)
     while
         not self.destroyed
         and processed < limit
+        and self.receiveRemaining > 0
         and self.receiveQueueHead <= self.receiveQueueTail
     do
+        local acquire: (() -> boolean)? = self.acquireReceiveWork
+        if acquire and not acquire() then
+            break
+        end
         local head = self.receiveQueueHead
         local queued = self.receiveQueue[head]
         if not queued then
@@ -190,6 +217,11 @@ function Impl._drainReceiveQueue(self: PeerState, limit: number)
         self.receiveQueue[head] = nil
         self.receiveQueueHead = head + 1
         self.receiveQueueBytes -= queued.raw
+        if queued.carrier == "unreliable" then
+            self.queuedUnreliableFrames -= 1
+            self.queuedUnreliableBytes -= queued.raw
+        end
+        self.receiveRemaining -= 1
         local queuedCalled = safe(self._receiveNow, self, queued.frame, queued.carrier)
         processed += 1
         if not queuedCalled then
@@ -201,6 +233,8 @@ function Impl._drainReceiveQueue(self: PeerState, limit: number)
         self.receiveQueueHead = 1
         self.receiveQueueTail = 0
         self.receiveQueueBytes = 0
+        self.queuedUnreliableFrames = 0
+        self.queuedUnreliableBytes = 0
     elseif self.receiveQueueHead > self.maximumQueuedFrames then
         local tail = self.receiveQueueTail
         local nextTail = 0
@@ -288,7 +322,7 @@ function Impl._finishRequest(
     local count = math.max(0, (self.routeRequests[pending.route] or 1) - 1)
     self.routeRequests[pending.route] = if count > 0 then count else nil
     metric(self, "request", event)
-    safe(pending.callback, success, payload, reason)
+    Callbacks.synchronous(pending.callback, success, payload, reason)
     return true
 end
 
@@ -297,24 +331,34 @@ function Impl._terminate(self: PeerState, reason: string)
         return
     end
     self.destroyed = true
-    local ids = {}
-    for requestId in self.requests do
-        table.insert(ids, requestId)
-    end
-    for _, requestId in ipairs(ids) do
-        self:_finishRequest(requestId, "cancelled", false, nil, reason)
-    end
-    table.clear(self.listeners)
+    self.terminalReason = reason
+    -- Release all ownership before notifications or request settlement callbacks.
+    local pending = self.requests
+    self.requests = {}
+    self.requestCount = 0
+    table.clear(self.routeRequests)
     table.clear(self.batchListeners)
+    table.clear(self.listeners)
     table.clear(self.cancelListeners)
     table.clear(self.receiveQueue)
     self.receiveQueueHead = 1
     self.receiveQueueTail = 0
     self.receiveQueueBytes = 0
+    self.queuedUnreliableFrames = 0
+    self.queuedUnreliableBytes = 0
     if self.egress then
         self.egress:close()
     end
     metric(self, "retained", 0, 0)
+    if self.onTerminate then
+        Callbacks.synchronous(self.onTerminate, reason)
+    end
+    for _, request in pending do
+        if request then
+            metric(self, "request", "cancelled")
+            Callbacks.synchronous(request.callback, false, nil, reason)
+        end
+    end
 end
 
 function Impl._sendNow(
@@ -863,7 +907,7 @@ function Impl._receiveNow(self: PeerState, frame: buffer, carrier: string?): (bo
     return false, "listener_failed"
 end
 
-function Impl._admitAttempt(self: PeerState): (boolean, string?)
+function Impl._admitAttempt(self: PeerState, carrier: string?): (boolean, string?)
     local ok, now = safe(self.clock)
     if not ok or not finite(now) then
         return false, "clock_failed"
@@ -874,7 +918,8 @@ function Impl._admitAttempt(self: PeerState): (boolean, string?)
         self.ingressPacketTokens + math.max(0, now - last) * self.ingressPacketRefill
     )
     self.ingressPacketLast = math.max(last, now)
-    if self.ingressPacketTokens < 1 then
+    local reserve = if carrier == "unreliable" then self.ingressReliableReserve else 0
+    if self.ingressPacketTokens < 1 + reserve then
         return false, "ingress_packets"
     end
     self.ingressPacketTokens -= 1
@@ -885,7 +930,7 @@ function Impl.receive(self: PeerState, frame: any, carrier: string?): (boolean, 
     if self.destroyed then
         return false, "destroyed"
     end
-    local attempted, attemptReason = self:_admitAttempt()
+    local attempted, attemptReason = self:_admitAttempt(carrier)
     if not attempted then
         if carrier ~= "unreliable" then
             self:_terminate(attemptReason or "ingress_limited")
@@ -900,7 +945,22 @@ function Impl.receive(self: PeerState, frame: any, carrier: string?): (boolean, 
     if raw > self.maximumInboundFrameBytes then
         return false, "frame_too_large"
     end
-    if self.receiving or queuedFrames(self) > 0 then
+    local mustQueue = self.receiving or queuedFrames(self) > 0 or self.receiveRemaining <= 0
+    if not mustQueue and self.acquireReceiveWork and not self.acquireReceiveWork() then
+        mustQueue = true
+    end
+    if mustQueue then
+        if
+            carrier == "unreliable"
+            and (
+                self.queuedUnreliableFrames
+                    >= self.maximumQueuedFrames - self.reserveQueueFrames
+                or raw
+                    > self.maximumQueuedBytes - self.reserveQueueBytes - self.queuedUnreliableBytes
+            )
+        then
+            return false, "receive_backpressure"
+        end
         if
             queuedFrames(self) >= self.maximumQueuedFrames
             or raw > self.maximumQueuedBytes - self.receiveQueueBytes
@@ -913,10 +973,14 @@ function Impl.receive(self: PeerState, frame: any, carrier: string?): (boolean, 
         self.receiveQueueTail += 1
         self.receiveQueue[self.receiveQueueTail] = {
             frame = frame,
-            carrier = carrier,
+            carrier = carrier :: string?,
             raw = raw,
         }
         self.receiveQueueBytes += raw
+        if carrier == "unreliable" then
+            self.queuedUnreliableFrames += 1
+            self.queuedUnreliableBytes += raw
+        end
         metric(self, "retained", queuedFrames(self), self.requestCount)
         if self.receiving then
             return true, "queued"
@@ -928,6 +992,7 @@ function Impl.receive(self: PeerState, frame: any, carrier: string?): (boolean, 
     end
 
     self.receiving = true
+    self.receiveRemaining -= 1
     local called, accepted, reason = safe(self._receiveNow, self, frame, carrier)
     local firstAccepted = if called then accepted else false
     local firstReason = if called then reason else "receive_failed"
@@ -942,6 +1007,10 @@ end
 function Impl.step(self: PeerState): number
     if self.destroyed then
         return 0
+    end
+    -- A yielding listener owns the current slice; reentrant steps cannot refill it.
+    if not self.receiving then
+        self.receiveRemaining = self.maximumReceiveFramesPerStep
     end
     if self.egress then
         self.egress:step()
@@ -980,7 +1049,11 @@ end
 function Impl.status(self: PeerState): any
     local egress = if self.egress then self.egress:status() else { items = 0, bytes = 0 }
     return {
+        egressItems = egress.items,
+        egressBytes = egress.bytes,
         destroyed = self.destroyed,
+        terminalReason = self.terminalReason,
+        receiveRemaining = self.receiveRemaining,
         outstandingRequests = self.requestCount,
         sentReliableSequence = self.sentR,
         sentUnreliableSequence = self.sentU,
@@ -988,8 +1061,8 @@ function Impl.status(self: PeerState): any
         receivedUnreliableSequence = self.recvU,
         queuedFrames = queuedFrames(self),
         queuedBytes = self.receiveQueueBytes,
-        egressItems = egress.items,
-        egressBytes = egress.bytes,
+        queuedUnreliableFrames = self.queuedUnreliableFrames,
+        queuedUnreliableBytes = self.queuedUnreliableBytes,
     }
 end
 

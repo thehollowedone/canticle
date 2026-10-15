@@ -138,3 +138,65 @@ Supported schemas: packed Boolean arrays or arrays of records with 1–16 requir
 Use the encoder with batch sends and the decoder with `onBatchValues`; single values use the runtime codec. Keep server decoders in ServerScriptService. The separate `generate-client-codec.luau` and `generate-native-codec.luau` tools accept a schema path and an output file.
 
 Optional `--trust-outbound` skips outgoing primitive checks. Structural/allocation limits and server validation remain active; invalid local primitives may be coerced or throw. Generated modules request native compilation with ordinary Luau fallback. Batch memoization is scoped to one call and disabled for metatable-bearing inputs.
+
+## Receive budgets and terminal recovery
+
+`maximumReceiveFramesPerStep` limits all frame dispatches between `peer:step()`
+calls. Separate remote callbacks do not refill it. Excess frames wait in the
+bounded FIFO; acceptance into that queue does not mean a listener has executed.
+Call `step()` regularly when using a peer without the Remote adapter.
+
+Terminal overload removes the server peer and marks its session closed. The
+same challenge cannot reopen that epoch. The client retains its handshake
+listener and exposes `status().terminalReason`, including `remote_closed`.
+Pending requests settle once; no application operation is replayed automatically.
+Create a new client with a fresh challenge to reconnect, and reconcile any
+consequential operation whose result is unknown before retrying it.
+
+Terminal control messages use the existing handshake remote. The server sends
+at most three notifications per terminal session, at least 0.5 seconds apart,
+from heartbeat stepping or validated handshake traffic. Delivery is best effort:
+if all notifications are lost, an application timeout and explicit reconnect are
+still needed. Update client and server together. Old clients do not understand
+terminal notifications.
+
+Request settlement, metrics, and terminal callbacks must not yield; yielding
+callbacks are cancelled. Teardown releases retained state before notifying the
+adapter or settling pending requests. Receive listeners keep their existing
+yielding behavior.
+
+## Reliable capacity and admission sizing
+
+Unreliable traffic cannot spend `ingressReliableReserve` packet tokens. Its
+default is min(16, floor(ingress packet capacity / 4)). Queued unreliable frames
+also respect `receiveQueueReliableReserve = { frames, bytes }`: defaults reserve
+min(8, ceil(queue frame capacity / 4)) slots and enough bytes for the largest
+reliable frame, capped by queue capacity. Both reserves may be set to zero.
+They divide existing capacity; they do not increase the queue or guarantee
+reliable delivery when reliable traffic itself exceeds capacity.
+
+Admission keeps its shared-route default of 1,024 burst tokens and 512 tokens per
+second. Twenty clients sending 30 updates per second need 600 tokens per second
+on that route. A larger burst only postpones sustained drops. Measure frame
+sizes, dispatch cost, and desired update frequency before changing budgets.
+For a measured 600/s route, a bounded override such as
+`routeLimits = { [routeId] = { sharedRoutePackets = { capacity = 1024, refillPerSecond = 660 } } }`
+provides some headroom without changing other routes.
+
+At most 256 route IDs (1..65535) may have overrides. Supported fields are
+`sharedRoutePackets`, `sharedRouteRawBytes`, and `sharedRouteExpandedBytes`.
+Capacities must be finite, positive, and at most 1e9; refill rates must be finite,
+nonnegative, and at most 1e9. Peer and global packet/raw/expanded buckets also
+reserve a default 12.5% for reliable work when the adapter identifies an
+unreliable route; `reliableReserveFraction` accepts 0..0.5.
+
+`Admission:status()` and the server adapter's `status().admission` expose accepted
+counts and fixed-reason denial counts. Valid reliable frames denied by ordinary
+admission still consume their sequence position; transport ordering is not an
+application delivery guarantee. Request timeouts, acknowledgements, or state
+reconciliation must make missing application work visible. Terminal queue or
+ingress overload closes the session instead of leaving a destroyed peer active.
+
+The server Remote adapter shares a 128-frame receive budget per step (configurable
+from 1 to 4096 with `settings.maximumReceiveFramesPerStep`) and rotates the first
+peer served. A suspended listener does not prevent later steps serving other peers.

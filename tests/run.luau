@@ -1,4 +1,6 @@
 local suites = {
+    require("./TransportRecoveryReview.spec"),
+    require("./TransportRecovery.spec"),
     require("./TransportCodec.spec"),
     require("./TransportAdmission.spec"),
     require("./TransportCore.spec"),

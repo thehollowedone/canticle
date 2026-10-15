@@ -8,8 +8,18 @@ local Manifest = if script
 local Admission = if script
     then require(script.Parent.TransportAdmission)
     else require("./TransportAdmission")
+local Callbacks = if script
+    then require(script.Parent.TransportCallbacks)
+    else require("./TransportCallbacks")
 local Remote = {}
-type Session = { challenge: number, epoch: number, active: boolean }
+type Session = {
+    challenge: number,
+    epoch: number,
+    active: boolean,
+    terminal: boolean?,
+    terminalAttempts: number?,
+    terminalNext: number?,
+}
 type Creation = { session: Session }
 local U32 = 4294967295
 local ADAPTER_EVENTS = {
@@ -18,6 +28,7 @@ local ADAPTER_EVENTS = {
     session_replaced = 0,
     peer_creation_failed = 0,
     pre_ready_frame_rejected = 0,
+    peer_terminated = 0,
     other = 0,
 }
 
@@ -70,7 +81,7 @@ local function observe(metrics: any, counters: any?, event: string)
     end
     local callback = metrics and metrics.adapter
     if type(callback) == "function" then
-        pcall(callback, metrics, event)
+        Callbacks.synchronous(callback, metrics, event)
     end
 end
 
@@ -148,6 +159,11 @@ function Remote.client(
             elseif epoch ~= replyEpoch then
                 observe(metrics, nil, "handshake_denied")
             end
+        elseif phase == "closed" and epoch == replyEpoch then
+            if peer then
+                peer:_terminate("remote_closed")
+            end
+            close()
         elseif phase == "ready" and epoch == replyEpoch then
             confirmed = true
         else
@@ -169,7 +185,7 @@ function Remote.client(
             pcall(waitForRetry)
         end
     end
-    if epoch == nil then
+    if epoch == nil or state ~= "OPEN" then
         observe(metrics, nil, "handshake_denied")
         close()
         error("transport handshake failed")
@@ -177,6 +193,24 @@ function Remote.client(
 
     local config = table.clone(options)
     config.epoch = epoch
+    local suppliedTerminate = config.onTerminate
+    config.onTerminate = function(reason)
+        if state == "OPEN" then
+            -- One terminal control message, never replay application frames.
+            close()
+            Callbacks.synchronous(
+                handshake.FireServer,
+                handshake,
+                challenge,
+                manifest.version,
+                manifest.fingerprint,
+                "closed"
+            )
+        end
+        if type(suppliedTerminate) == "function" then
+            Callbacks.synchronous(suppliedTerminate, reason)
+        end
+    end
     config.sendReliable = function(frame)
         if not confirmed then
             observe(metrics, nil, "pre_ready_frame_rejected")
@@ -241,9 +275,8 @@ function Remote.client(
             pcall(waitForRetry)
         end
     end
-    disconnect(handshakeConnection)
-    handshakeConnection = nil
-    if not confirmed then
+    -- Keep the bounded control listener for terminal notifications.
+    if not confirmed or state ~= "OPEN" then
         observe(metrics, nil, "handshake_denied")
         close()
         error("transport handshake confirmation failed")
@@ -291,6 +324,13 @@ function Remote.server(
         type(windowSeconds) == "number" and windowSeconds > 0 and windowSeconds <= 300,
         "invalid handshake attempt window"
     )
+    local maximumReceiveFramesPerStep = settings.maximumReceiveFramesPerStep or 128
+    assert(integer(maximumReceiveFramesPerStep, 1, 4096), "invalid server receive work budget")
+    local receiveRemaining = maximumReceiveFramesPerStep
+    local peerOrder: { Player } = {}
+    local nextPeer = 1
+    local stepOwner: thread? = nil
+    local stepGeneration = 0
     local handle = {}
 
     local function allowWindow(windows: any, player: Player, maximum: number): boolean
@@ -314,9 +354,48 @@ function Remote.server(
         creations[player] = nil
         local peer = peers[player]
         peers[player] = nil
+        local index = table.find(peerOrder, player)
+        if index then
+            table.remove(peerOrder, index)
+        end
         if peer then
             peer:destroy()
         end
+    end
+
+    local function notifyTerminal(player: Player, session: Session)
+        if state ~= "OPEN" or sessions[player] ~= session or not session.terminal then
+            return
+        end
+        local attempts = session.terminalAttempts or 0
+        if attempts >= 3 then
+            return
+        end
+        local called, now = Callbacks.synchronous(clock)
+        if
+            not called
+            or type(now) ~= "number"
+            or now ~= now
+            or now == math.huge
+            or now == -math.huge
+        then
+            return
+        end
+        if session.terminalNext and now < session.terminalNext then
+            return
+        end
+        session.terminalAttempts = attempts + 1
+        session.terminalNext = now + 0.5
+        Callbacks.synchronous(
+            handshake.FireClient,
+            handshake,
+            player,
+            session.challenge,
+            session.epoch,
+            advertised.version,
+            advertised.fingerprint,
+            "closed"
+        )
     end
 
     local function create(player: Player, epoch: number, token: Creation): PeerState?
@@ -334,9 +413,48 @@ function Remote.server(
             return nil
         end
         local config = table.clone(supplied)
+        local compatible = pcall(checkedManifest, config.routes, advertised)
+        if not compatible then
+            if creations[player] == token then
+                creations[player] = nil
+            end
+            return nil
+        end
+        local suppliedTerminate = config.onTerminate
+        config.onTerminate = function(reason)
+            if state == "OPEN" and sessions[player] == token.session then
+                token.session.active = false
+                token.session.terminal = true
+                remove(player, reason)
+                observe(metrics, adapterEvents, "peer_terminated")
+                notifyTerminal(player, token.session)
+            end
+            if type(suppliedTerminate) == "function" then
+                Callbacks.synchronous(suppliedTerminate, reason)
+            end
+        end
+        config.acquireReceiveWork = function()
+            if receiveRemaining <= 0 then
+                return false
+            end
+            receiveRemaining -= 1
+            return true
+        end
+        local unreliableRoutes: { [number]: boolean } = {}
+        for _, route in ipairs(config.routes :: { any }) do
+            if route.lane == "unreliable" then
+                unreliableRoutes[route.id] = true
+            end
+        end
         local suppliedAdmit: ((number, number, number) -> (boolean, string?))? = config.admit
-        config.admit = function(route, rawBytes, expandedBytes)
-            local admitted, reason = admission:admit(player, route, rawBytes, expandedBytes)
+        config.admit = function(route: number, rawBytes: number, expandedBytes: number)
+            local admitted, reason = admission:admit(
+                player,
+                route,
+                rawBytes,
+                expandedBytes,
+                unreliableRoutes[route] == true
+            )
             if not admitted then
                 return false, reason
             end
@@ -344,13 +462,6 @@ function Remote.server(
                 return suppliedAdmit(route, rawBytes, expandedBytes)
             end
             return true, nil
-        end
-        local compatible = pcall(checkedManifest, config.routes, advertised)
-        if not compatible then
-            if creations[player] == token then
-                creations[player] = nil
-            end
-            return nil
         end
         config.epoch = epoch
         config.sendReliable = function(frame)
@@ -393,12 +504,13 @@ function Remote.server(
             return nil
         end
         peers[player] = peer
+        table.insert(peerOrder, player)
         local onPeer = config.onPeer or settings.onPeer
         if type(onPeer) == "function" then
             local setup = pcall(onPeer, player, peer)
             if not setup or state ~= "OPEN" or creations[player] ~= token then
                 if peers[player] == peer then
-                    peers[player] = nil
+                    remove(player, "peer_creation_failed")
                 end
                 peer:destroy()
                 if creations[player] == token then
@@ -409,7 +521,7 @@ function Remote.server(
         end
         if peer:status().destroyed then
             if peers[player] == peer then
-                peers[player] = nil
+                remove(player, "peer_creation_failed")
             end
             if creations[player] == token then
                 creations[player] = nil
@@ -437,17 +549,54 @@ function Remote.server(
         if state ~= "OPEN" then
             return 0
         end
+        local owner = stepOwner
+        if
+            owner
+            and coroutine.status(owner) ~= "suspended"
+            and coroutine.status(owner) ~= "dead"
+        then
+            return 0
+        end
+        stepGeneration += 1
+        local generation = stepGeneration
+        stepOwner = coroutine.running()
+        receiveRemaining = maximumReceiveFramesPerStep
         local expired = 0
-        for _, peer in peers do
+        for player, session in sessions do
+            if session and session.terminal then
+                notifyTerminal(player, session)
+            end
+        end
+        -- Snapshot so terminal callbacks/removals cannot skip or duplicate a peer.
+        -- Rotate priority: a busy peer cannot own every heartbeat's first slice.
+        local order = table.clone(peerOrder)
+        local count = #order
+        local first = if count > 0 then ((nextPeer - 1) % count) + 1 else 1
+        nextPeer = first + 1
+        for offset = 0, count - 1 do
+            if generation ~= stepGeneration or state ~= "OPEN" then
+                return expired
+            end
+            local player = order[((first + offset - 1) % count) + 1]
+            local peer = peers[player]
             if peer then
                 expired += peer:step()
             end
+        end
+        if generation == stepGeneration then
+            stepOwner = nil
         end
         return expired
     end
 
     function handle:status(): any
-        return { state = state, adapter = table.clone(adapterEvents) }
+        return {
+            state = state,
+            adapter = table.clone(adapterEvents),
+            admission = admission:status(),
+            receiveRemaining = receiveRemaining,
+            maximumReceiveFramesPerStep = maximumReceiveFramesPerStep,
+        }
     end
 
     local handshakeConnection = handshake.OnServerEvent:Connect(function(player, ...)
@@ -474,11 +623,24 @@ function Remote.server(
         end
         local existing = sessions[player]
         if count == 4 then
+            if phase == "closed" and existing and existing.challenge == challenge then
+                existing.active = false
+                existing.terminal = true
+                remove(player, "remote_closed")
+                notifyTerminal(player, existing)
+                return
+            end
+            if existing and existing.terminal then
+                notifyTerminal(player, existing)
+                observe(metrics, adapterEvents, "handshake_denied")
+                return
+            end
             if phase ~= "ready" or not existing or existing.challenge ~= challenge then
                 observe(metrics, adapterEvents, "handshake_denied")
                 return
             end
-            if existing.active and peers[player] then
+            local existingPeer = peers[player]
+            if existing.active and existingPeer and not existingPeer:status().destroyed then
                 handshake:FireClient(
                     player,
                     challenge,
@@ -493,7 +655,7 @@ function Remote.server(
                 observe(metrics, adapterEvents, "handshake_denied")
                 return
             end
-            local token = { session = existing }
+            local token: Creation = { session = existing :: Session }
             creations[player] = token
             local peer = create(player, existing.epoch, token)
             if state == "OPEN" and peer and sessions[player] == existing then
@@ -511,6 +673,11 @@ function Remote.server(
             return
         end
         if existing and existing.challenge == challenge then
+            if existing.terminal then
+                notifyTerminal(player, existing)
+                observe(metrics, adapterEvents, "handshake_denied")
+                return
+            end
             handshake:FireClient(
                 player,
                 challenge,
@@ -526,7 +693,8 @@ function Remote.server(
             return
         end
         nextEpoch = if nextEpoch >= U32 then 1 else nextEpoch + 1
-        local session = { challenge = challenge, epoch = nextEpoch, active = false }
+        local session: Session =
+            { challenge = challenge, epoch = nextEpoch, active = false, terminal = false }
         sessions[player] = session
         remove(player, "session_replaced")
         if existing then
@@ -593,6 +761,7 @@ function Remote.server(
         disconnect(playerConnection)
         disconnect(stepConnection)
         table.clear(creations)
+        table.clear(peerOrder)
         table.clear(sessions)
         table.clear(attemptWindows)
         table.clear(replacementWindows)

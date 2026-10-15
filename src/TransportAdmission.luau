@@ -38,9 +38,13 @@ local function readSpec(
     refill: number
 ): Spec
     local value = options[name] or fallback or {}
+    assert(type(value) == "table", "invalid admission policy")
     local cap = value.capacity or capacity
     local rate = value.refillPerSecond or refill
-    assert(finite(cap) and cap > 0 and finite(rate) and rate >= 0, "invalid admission limit")
+    assert(
+        finite(cap) and cap > 0 and cap <= 1e9 and finite(rate) and rate >= 0 and rate <= 1e9,
+        "invalid admission limit"
+    )
     return { capacity = cap, refill = rate }
 end
 
@@ -73,6 +77,59 @@ function Admission.new(options: any): any
     local globalPackets = readSpec(options, "globalPackets", nil, 4096, 2048)
     local globalExpanded =
         readSpec(options, "globalExpandedBytes", nil, 8 * 1024 * 1024, 4 * 1024 * 1024)
+
+    local reserveFraction = options.reliableReserveFraction
+    if reserveFraction == nil then
+        reserveFraction = 0.125
+    end
+    assert(
+        finite(reserveFraction) and reserveFraction >= 0 and reserveFraction <= 0.5,
+        "invalid reliable reserve fraction"
+    )
+    local routeLimits = {}
+    local rawLimits = options.routeLimits or {}
+    assert(type(rawLimits) == "table", "invalid route admission limits")
+    local count = 0
+    for id, limits in pairs(rawLimits) do
+        count += 1
+        assert(
+            count <= 256
+                and type(id) == "number"
+                and finiteInteger(id, 1)
+                and id <= 65535
+                and type(limits) == "table",
+            "invalid route admission limits"
+        )
+        routeLimits[id] = {
+            packets = readSpec(
+                limits,
+                "sharedRoutePackets",
+                nil,
+                sharedPackets.capacity,
+                sharedPackets.refill
+            ),
+            raw = readSpec(
+                limits,
+                "sharedRouteRawBytes",
+                nil,
+                sharedRaw.capacity,
+                sharedRaw.refill
+            ),
+            expanded = readSpec(
+                limits,
+                "sharedRouteExpandedBytes",
+                nil,
+                sharedExpanded.capacity,
+                sharedExpanded.refill
+            ),
+        }
+    end
+    local denials: { [string]: number } = {}
+    local accepted = 0
+    local function deny(reason: string): (boolean, string?)
+        denials[reason] = (denials[reason] or 0) + 1
+        return false, reason
+    end
 
     local started = now()
     local gate = {
@@ -129,10 +186,14 @@ function Admission.new(options: any): any
         if value then
             return value
         end
+        local limits = routeLimits[route]
+        local packets = if limits then limits.packets else sharedPackets
+        local raw = if limits then limits.raw else sharedRaw
+        local expanded = if limits then limits.expanded else sharedExpanded
         local created: SharedBucket = {
-            packets = makeBucket(sharedPackets.capacity, sharedPackets.refill, current),
-            raw = makeBucket(sharedRaw.capacity, sharedRaw.refill, current),
-            expanded = makeBucket(sharedExpanded.capacity, sharedExpanded.refill, current),
+            packets = makeBucket(packets.capacity, packets.refill, current),
+            raw = makeBucket(raw.capacity, raw.refill, current),
+            expanded = makeBucket(expanded.capacity, expanded.refill, current),
         }
         self.sharedRoutes[route] = created
         return created
@@ -142,7 +203,8 @@ function Admission.new(options: any): any
         peerId: any,
         route: number,
         rawBytes: number,
-        expandedBytes: number
+        expandedBytes: number,
+        unreliable: boolean?
     ): (boolean, string?)
         if
             self.closed
@@ -150,7 +212,7 @@ function Admission.new(options: any): any
             or not finiteInteger(expandedBytes, 0)
             or not finiteInteger(route, 1)
         then
-            return false, "invalid_admission"
+            return deny("invalid_admission")
         end
 
         local current = self.clock()
@@ -171,38 +233,42 @@ function Admission.new(options: any): any
         refresh(self.globalRaw, current)
         refresh(self.globalExpanded, current)
 
-        if peer.packets.tokens < 1 then
-            return false, "peer_packets"
+        local fraction = if unreliable == true then reserveFraction else 0
+        if peer.packets.tokens < 1 + math.floor(peer.packets.capacity * fraction) then
+            return deny("peer_packets")
         end
-        if peer.raw.tokens < rawBytes then
-            return false, "peer_raw_bytes"
+        if peer.raw.tokens < rawBytes + math.floor(peer.raw.capacity * fraction) then
+            return deny("peer_raw_bytes")
         end
-        if peer.expanded.tokens < expandedBytes then
-            return false, "peer_expanded_bytes"
+        if peer.expanded.tokens < expandedBytes + math.floor(peer.expanded.capacity * fraction) then
+            return deny("peer_expanded_bytes")
         end
         if peerRoute.raw.tokens < rawBytes then
-            return false, "peer_route_raw_bytes"
+            return deny("peer_route_raw_bytes")
         end
         if peerRoute.expanded.tokens < expandedBytes then
-            return false, "peer_route_expanded_bytes"
+            return deny("peer_route_expanded_bytes")
         end
         if sharedRoute.packets.tokens < 1 then
-            return false, "shared_route_packets"
+            return deny("shared_route_packets")
         end
         if sharedRoute.raw.tokens < rawBytes then
-            return false, "shared_route_raw_bytes"
+            return deny("shared_route_raw_bytes")
         end
         if sharedRoute.expanded.tokens < expandedBytes then
-            return false, "shared_route_expanded_bytes"
+            return deny("shared_route_expanded_bytes")
         end
-        if self.globalPackets.tokens < 1 then
-            return false, "global_packets"
+        if self.globalPackets.tokens < 1 + math.floor(self.globalPackets.capacity * fraction) then
+            return deny("global_packets")
         end
-        if self.globalRaw.tokens < rawBytes then
-            return false, "global_raw_bytes"
+        if self.globalRaw.tokens < rawBytes + math.floor(self.globalRaw.capacity * fraction) then
+            return deny("global_raw_bytes")
         end
-        if self.globalExpanded.tokens < expandedBytes then
-            return false, "global_expanded_bytes"
+        if
+            self.globalExpanded.tokens
+            < expandedBytes + math.floor(self.globalExpanded.capacity * fraction)
+        then
+            return deny("global_expanded_bytes")
         end
 
         peer.packets.tokens -= 1
@@ -216,7 +282,20 @@ function Admission.new(options: any): any
         self.globalPackets.tokens -= 1
         self.globalRaw.tokens -= rawBytes
         self.globalExpanded.tokens -= expandedBytes
+        accepted += 1
         return true, nil
+    end
+
+    function gate:status(): any
+        return {
+            accepted = accepted,
+            denials = table.clone(denials),
+            reliableReserveFraction = reserveFraction,
+            sharedRoutePackets = {
+                capacity = sharedPackets.capacity,
+                refillPerSecond = sharedPackets.refill,
+            },
+        }
     end
 
     function gate:clearPeer(peerId: any)
