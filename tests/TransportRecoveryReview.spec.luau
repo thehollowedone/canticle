@@ -1,6 +1,6 @@
 local T = require("../src/Transport")
 local hierarchical = false
-return function ()
+return function()
     local routes = {
         { id = 1, lane = "reliable", maximumFrameBytes = 128, maximumPayloadBytes = 64 },
         { id = 2, lane = "unreliable", maximumFrameBytes = 128, maximumPayloadBytes = 64 },
@@ -22,7 +22,7 @@ return function ()
         function s:Connect(fn)
             hs[fn] = true
             return {
-                Disconnect = function ()
+                Disconnect = function()
                     hs[fn] = nil
                 end,
             }
@@ -68,7 +68,7 @@ return function ()
         settings.handshakeRemote = h
         settings.manifest = manifest
         settings.stepSignal = heartbeat
-        local server = T.Remote.server(r, nil, optionsFor or function ()
+        local server = T.Remote.server(r, nil, optionsFor or function()
             return { routes = routes }
         end, settings)
         local function client(challenge, extra)
@@ -86,14 +86,14 @@ return function ()
     -- Malformed configuration must release creation so a corrected attempt can succeed.
     do
         local malformed = true
-        local s, _, p, _, h, _, m = fixture(function ()
+        local s, _, p, _, h, _, m = fixture(function()
             return { routes = if malformed then 42 else routes }
         end)
         h:FireServer(1, m.version, m.fingerprint)
-        assert(pcall(function ()
+        assert(pcall(function()
             h:FireServer(1, m.version, m.fingerprint, "ready")
         end))
-        assert(s:findPeer(p) == nil)
+        assert(s:findPeer(p) == nil, "malformed configuration must not publish a peer")
         malformed = false
         h:FireServer(1, m.version, m.fingerprint, "ready")
         assert(s:findPeer(p))
@@ -101,31 +101,31 @@ return function ()
     end
     -- A closed handshake invalidates an in-flight initializer before it can publish.
     if not hierarchical then
-        local s, _, p, _, h, _, m = fixture(function ()
+        local s, _, p, _, h, _, m = fixture(function()
             coroutine.yield()
             return { routes = routes }
         end)
         h:FireServer(2, m.version, m.fingerprint)
-        local co = coroutine.create(function ()
+        local co = coroutine.create(function()
             h:FireServer(2, m.version, m.fingerprint, "ready")
         end)
         assert(coroutine.resume(co))
         h:FireServer(2, m.version, m.fingerprint, "closed")
         assert(coroutine.resume(co))
-        assert(s:findPeer(p) == nil)
+        assert(s:findPeer(p) == nil, "closed handshake must invalidate the in-flight initializer")
         s:destroy()
     end
     -- A missed terminal notification retries with bounded frequency and closes client once.
     do
         local now = 0
         local s, client, p, r, h, heartbeat, m = fixture(nil, {
-            clock = function ()
+            clock = function()
                 return now
             end,
         })
         local stopped = 0
         local old = client(101, {
-            onTerminate = function ()
+            onTerminate = function()
                 stopped += 1
                 coroutine.yield()
             end,
@@ -145,41 +145,58 @@ return function ()
             original(self, player, ...)
         end
         s:findPeer(p):destroy()
-        assert(s:findPeer(p) == nil and not old:status().destroyed and sends == 1)
+        assert(
+            s:findPeer(p) == nil and not old:status().destroyed and sends == 1,
+            "first lost terminal notification must remove the server peer but leave the client alive"
+        )
         s:step()
-        assert(sends == 1)
+        assert(sends == 1, "terminal notification must not retry before its deadline")
         now = 0.5
         s:step()
         assert(
             old:status().destroyed
                 and old:status().terminalReason == "remote_closed"
                 and stopped == 1
-                and sends == 2
+                and sends == 2,
+            "terminal retry must close the client exactly once with remote_closed"
         )
         assert(
-            h.OnClientEvent:Count() == 0 and r.OnClientEvent:Count() == 0 and heartbeat:Count() == 1
+            h.OnClientEvent:Count() == 0 and r.OnClientEvent:Count() == 0 and heartbeat:Count() == 1,
+            "terminal cleanup must disconnect client listeners but retain the server heartbeat"
         )
         for i = 1, 20 do
             now = i
             s:step()
         end
-        assert(sends == 3)
+        assert(sends == 3, "terminal retries must stop after the bounded attempt count")
         h:FireServer(101, m.version, m.fingerprint, "ready")
-        assert(s:findPeer(p) == nil and sends == 3)
+        assert(
+            s:findPeer(p) == nil and sends == 3,
+            "stale ready handshake must not recreate a retired peer or restart retries"
+        )
         local fresh, close = client(102)
-        assert(fresh.epoch ~= epoch and fresh:status().sentReliableSequence == 0)
+        assert(
+            fresh.epoch ~= epoch and fresh:status().sentReliableSequence == 0,
+            "fresh client must get a new epoch with an empty reliable sequence"
+        )
         h.OnClientEvent:Fire(101, epoch, m.version, m.fingerprint, "closed")
-        assert(not fresh:status().destroyed)
+        assert(
+            not fresh:status().destroyed,
+            "stale terminal notification must not destroy the fresh client"
+        )
         r.OnServerEvent:Fire(p, frame(epoch, 1))
-        assert(s:findPeer(p):status().receivedReliableSequence == 0)
+        assert(
+            s:findPeer(p):status().receivedReliableSequence == 0,
+            "stale epoch frame must not advance the fresh peer sequence"
+        )
         close()
         s:destroy()
     end
     -- Terminal retry clock and transport callback must never retain heartbeat execution.
     do
         local yielding = false
-        local s, client, p, _, h = fixture(nil, {
-            clock = function ()
+        local s, client, p, _, _h = fixture(nil, {
+            clock = function()
                 if yielding then
                     coroutine.yield()
                 end
@@ -190,18 +207,21 @@ return function ()
         client(201)
         s:findPeer(p):destroy()
         yielding = true
-        local co = coroutine.create(function ()
+        local co = coroutine.create(function()
             s:step()
         end)
         assert(coroutine.resume(co))
-        assert(coroutine.status(co) == "dead")
+        assert(
+            coroutine.status(co) == "dead",
+            "yielding retry clock must not suspend heartbeat execution"
+        )
         yielding = false
         s:step()
         s:destroy()
     end
     -- Stable peers are serviced while another peer's callback yields; stale steps do not reset work.
     if not hierarchical then
-        local s, _, _, r, h, _, m = fixture(function ()
+        local s, _, _, r, h, _, m = fixture(function()
             return { routes = routes, maximumReceiveFramesPerStep = 1 }
         end, { maximumReceiveFramesPerStep = 1 })
         local ps = { {}, {}, {} }
@@ -212,7 +232,7 @@ return function ()
             h.OnServerEvent:Fire(p, i, m.version, m.fingerprint)
             h.OnServerEvent:Fire(p, i, m.version, m.fingerprint, "ready")
             local peer = s:findPeer(p)
-            peer:on(1, function ()
+            peer:on(1, function()
                 seen[i] += 1
                 if i == 1 and seen[1] == 2 then
                     held = coroutine.running()
@@ -224,7 +244,7 @@ return function ()
             end
         end
 
-        local co = coroutine.create(function ()
+        local co = coroutine.create(function()
             s:step()
         end)
         assert(coroutine.resume(co))
@@ -235,14 +255,23 @@ return function ()
         for _ = 1, 6 do
             local before = seen[1] + seen[2] + seen[3]
             s:step()
-            assert(seen[1] + seen[2] + seen[3] - before <= 1)
+            assert(
+                seen[1] + seen[2] + seen[3] - before <= 1,
+                "each step must respect the shared one-frame receive budget"
+            )
         end
-        assert(seen[2] == 3 and seen[3] == 3)
+        assert(
+            seen[2] == 3 and seen[3] == 3,
+            "stable peers must drain while another listener yields"
+        )
         local remaining = s:status().receiveRemaining
         assert(coroutine.resume(co))
-        assert(s:status().receiveRemaining <= remaining)
+        assert(
+            s:status().receiveRemaining <= remaining,
+            "stale step must not replenish the remaining receive budget"
+        )
         s:step()
-        assert(seen[1] == 3)
+        assert(seen[1] == 3, "yielding peer must eventually finish its queued work")
         s:destroy()
     end
 end

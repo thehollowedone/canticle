@@ -6,7 +6,7 @@ local function bytes(text)
     return value
 end
 
-return function ()
+return function()
     local Frame = Transport.Frame
     local Peer = Transport.Peer
     local Manifest = Transport.Manifest
@@ -164,20 +164,20 @@ return function ()
     local client = Peer.new({
         epoch = 9,
         routes = routes,
-        sendReliable = function (value)
+        sendReliable = function(value)
             table.insert(clientToServer, value)
         end,
     })
     local server = Peer.new({
         epoch = 9,
         routes = routes,
-        sendReliable = function (value)
+        sendReliable = function(value)
             table.insert(serverToClient, value)
         end,
     })
 
     local observed = nil
-    server:on(1, function (value)
+    server:on(1, function(value)
         observed = buffer.readstring(value, 0, buffer.len(value))
     end)
     assert(client:send(1, bytes("ping")), "client must send reliable payload")
@@ -201,18 +201,18 @@ return function ()
     local batchSender = Peer.new({
         epoch = 71,
         routes = batchRoute,
-        sendReliable = function (value)
+        sendReliable = function(value)
             table.insert(batchWire, value)
         end,
     })
     local batchReceiver = Peer.new({
         epoch = 71,
         routes = batchRoute,
-        sendReliable = function () end,
+        sendReliable = function() end,
     })
     local smallInteger = assert(Codec.compile({ type = "integer", min = 0, max = 255 }))
     local receivedBatch = nil
-    batchReceiver:on(5, function (_, context)
+    batchReceiver:on(5, function(_, context)
         receivedBatch = context.slices
     end)
     assert(
@@ -227,7 +227,7 @@ return function ()
     end
 
     local decodedBatch = nil
-    local disconnectBatch = batchReceiver:onBatchValues(5, smallInteger, function (values, context)
+    local disconnectBatch = batchReceiver:onBatchValues(5, smallInteger, function(values, context)
         assert(context.batch == true and context.slices == nil, "decoded batch skips item copies")
         decodedBatch = values
     end)
@@ -277,7 +277,7 @@ return function ()
     local valid, _, batchError = smallInteger:decodeBatch(malformedBatch)
     assert(not valid and batchError == "invalid_batch_item", "malformed length must reject")
     local decodedCalls = 0
-    batchReceiver:onBatchValues(5, smallInteger, function ()
+    batchReceiver:onBatchValues(5, smallInteger, function()
         decodedCalls += 1
     end)
     local badFrame = assert(Frame.encode({
@@ -312,10 +312,10 @@ return function ()
         },
         maximumReceiveFramesPerStep = 3,
         ingressPackets = { capacity = 32, refillPerSecond = 0 },
-        sendReliable = function () end,
+        sendReliable = function() end,
     })
     local boundedObserved = 0
-    boundedReceive:on(1, function ()
+    boundedReceive:on(1, function()
         boundedObserved += 1
         if boundedObserved < 8 then
             local nextFrame = assert(Frame.encode({
@@ -344,12 +344,12 @@ return function ()
     assert(boundedObserved == 8, "later steps must finish queued work without dropping it")
     boundedReceive:destroy()
 
-    server:on(2, function (value, context)
+    server:on(2, function(value, context)
         assert(server:respond(2, context.requestId, value), "server must respond to request")
     end)
     local response = nil
     assert(
-        client:request(2, bytes("rpc"), 1, function (ok, value)
+        client:request(2, bytes("rpc"), 1, function(ok, value)
             if ok then
                 response = buffer.readstring(value, 0, buffer.len(value))
             end
@@ -410,8 +410,8 @@ return function ()
     local policyPeer = Peer.new({
         epoch = 12,
         routes = policyRoutes,
-        sendReliable = function () end,
-        admit = function ()
+        sendReliable = function() end,
+        admit = function()
             policyAdmissionCalls += 1
             return true, nil
         end,
@@ -439,7 +439,7 @@ return function ()
     )
 
     local postPolicyObserved = false
-    policyPeer:on(1, function ()
+    policyPeer:on(1, function()
         postPolicyObserved = true
     end)
     local afterCompressed = assert(
@@ -458,7 +458,7 @@ return function ()
     )
 
     local cancelledRequestId = nil
-    policyPeer:onCancel(2, function (requestId)
+    policyPeer:onCancel(2, function(requestId)
         cancelledRequestId = requestId
     end)
     local unknownCancel = assert(
@@ -478,7 +478,7 @@ return function ()
         "incoming cancellation must be direction-scoped and handled independently"
     )
     local requestObserved = false
-    policyPeer:on(2, function ()
+    policyPeer:on(2, function()
         requestObserved = true
     end)
     local validRequest = assert(
@@ -507,10 +507,10 @@ return function ()
     }) == nil, "unreliable routes must reject frames above Roblox's physical ceiling")
 
     local unreliableObserved = {}
-    policyPeer:on(3, function ()
+    policyPeer:on(3, function()
         table.insert(unreliableObserved, 3)
     end)
-    policyPeer:on(4, function ()
+    policyPeer:on(4, function()
         table.insert(unreliableObserved, 4)
     end)
     local laterRouteThree = assert(
@@ -550,13 +550,13 @@ return function ()
         routes = {
             { id = 1, lane = "reliable", maximumFrameBytes = 256, maximumPayloadBytes = 128 },
         },
-        sendReliable = function () end,
-        admit = function ()
+        sendReliable = function() end,
+        admit = function()
             admissionAttempts += 1
             return admissionAttempts > 1, "peer_packets"
         end,
     })
-    admissionPeer:on(1, function ()
+    admissionPeer:on(1, function()
         admittedObserved = true
     end)
     local deniedFrame = assert(
@@ -595,7 +595,7 @@ return function ()
             { id = 1, lane = "reliable", maximumFrameBytes = 256, maximumPayloadBytes = 128 },
         },
         ingressPackets = { capacity = 1, refillPerSecond = 0 },
-        sendReliable = function () end,
+        sendReliable = function() end,
     })
     assert(
         not ingressPeer:receive("not-a-buffer"),
@@ -614,9 +614,9 @@ return function ()
     local wrapReceiver = Peer.new({
         epoch = 41,
         routes = wrapRoutes,
-        sendReliable = function () end,
+        sendReliable = function() end,
     })
-    wrapReceiver:on(41, function () end)
+    wrapReceiver:on(41, function() end)
     local function wrapFrame(sequence)
         return assert(Frame.encode({
             lane = "reliable",

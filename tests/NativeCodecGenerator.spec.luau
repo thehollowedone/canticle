@@ -24,7 +24,7 @@ local function equal(a, b)
     return true
 end
 
-return function ()
+return function()
     for _, fixed in ipairs({ true, false }) do
         local fields = {}
 

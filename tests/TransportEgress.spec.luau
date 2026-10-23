@@ -6,7 +6,7 @@ local function bytes(text)
     return value
 end
 
-return function ()
+return function()
     local routes = {
         { id = 1, lane = "unreliable", maximumFrameBytes = 1000, maximumPayloadBytes = 900 },
         {
@@ -20,8 +20,8 @@ return function ()
     local unscheduled = Transport.Peer.new({
         epoch = 1,
         routes = routes,
-        sendReliable = function () end,
-        sendUnreliable = function () end,
+        sendReliable = function() end,
+        sendUnreliable = function() end,
     })
     local latestOk, latestReason = unscheduled:send(1, bytes("latest"), true)
     assert(
@@ -40,7 +40,7 @@ return function ()
     local peer = Transport.Peer.new({
         epoch = 2,
         routes = routes,
-        clock = function ()
+        clock = function()
             return now
         end,
         egress = {
@@ -50,10 +50,10 @@ return function ()
             maximumItemsPerStep = 2,
             maximumBytesPerStep = 256,
         },
-        sendReliable = function (frame)
+        sendReliable = function(frame)
             table.insert(emitted, frame)
         end,
-        sendUnreliable = function (frame)
+        sendUnreliable = function(frame)
             table.insert(emitted, frame)
         end,
     })
@@ -91,11 +91,11 @@ return function ()
         maximumAgeSeconds = 1,
         maximumItemsPerStep = 2,
         maximumBytesPerStep = 256,
-    }, function ()
+    }, function()
         return boundedNow
     end, nil, nil)
     for key = 1, 4 do
-        assert(bounded:submit("latest", key, bytes("expired"), function () end, false))
+        assert(bounded:submit("latest", key, bytes("expired"), function() end, false))
     end
     boundedNow = 2
     bounded:step()
@@ -110,7 +110,7 @@ return function ()
     local expiring = Transport.Peer.new({
         epoch = 3,
         routes = routes,
-        clock = function ()
+        clock = function()
             return now
         end,
         egress = {
@@ -120,8 +120,8 @@ return function ()
             maximumItemsPerStep = 2,
             maximumBytesPerStep = 256,
         },
-        sendReliable = function () end,
-        sendUnreliable = function () end,
+        sendReliable = function() end,
+        sendUnreliable = function() end,
     })
     now = 0
     assert(expiring:sendBatch(2, { bytes("durable") }), "bulk expiry fixture must queue")

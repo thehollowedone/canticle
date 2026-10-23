@@ -5,7 +5,7 @@ local function nextRandom(state)
     return (state * 1664525 + 1013904223) % 4294967296
 end
 
-return function ()
+return function()
     local codec = assert(
         Codec.compile({
             type = "object",

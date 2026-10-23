@@ -1,10 +1,10 @@
 local Admission = require("../src/TransportAdmission")
 local Metrics = require("../src/TransportMetrics")
 
-return function ()
+return function()
     local function gate(overrides)
         local options = {
-            clock = function ()
+            clock = function()
                 return 0
             end,
             packets = { capacity = 100, refillPerSecond = 0 },
@@ -89,7 +89,7 @@ return function ()
 
     local rollbackNow = 100
     local rollback = gate({
-        clock = function ()
+        clock = function()
             return rollbackNow
         end,
         packets = { capacity = 1, refillPerSecond = 1 },

@@ -1,4 +1,4 @@
-return function ()
+return function()
     local Admission = require("../src/TransportAdmission")
     local Config = require("../src/TransportConfig")
     local Frame = require("../src/TransportFrame")
@@ -27,60 +27,75 @@ return function ()
     local peer = Peer.new({
         epoch = 1,
         routes = routes,
-        sendReliable = function () end,
+        sendReliable = function() end,
         maximumReceiveFramesPerStep = 2,
     })
     local seen = 0
-    peer:on(1, function ()
+    peer:on(1, function()
         seen += 1
     end)
     for n = 1, 5 do
         assert(peer:receive(frame(n), "reliable"))
     end
-    assert(seen == 2 and peer:status().queuedFrames == 3)
+    assert(
+        seen == 2 and peer:status().queuedFrames == 3,
+        "initial receive budget must process two frames and queue three"
+    )
     peer:step()
-    assert(seen == 4)
+    assert(seen == 4, "first step must process two more queued frames")
     peer:step()
-    assert(seen == 5)
+    assert(seen == 5, "second step must process the last queued frame")
     peer:destroy()
     local settled, terminated = 0, 0
     local retiring = Peer.new({
         epoch = 1,
         routes = routes,
-        sendReliable = function () end,
-        onTerminate = function ()
+        sendReliable = function() end,
+        onTerminate = function()
             terminated += 1
         end,
     })
     for _ = 1, 2 do
-        assert(retiring:request(1, buffer.create(1), 1, function ()
+        assert(retiring:request(1, buffer.create(1), 1, function()
             settled += 1
             coroutine.yield()
         end))
     end
     retiring:destroy()
     retiring:destroy()
-    assert(settled == 2 and terminated == 1 and retiring:status().outstandingRequests == 0)
+    assert(
+        settled == 2 and terminated == 1 and retiring:status().outstandingRequests == 0,
+        "repeated destroy must settle both requests and terminate exactly once"
+    )
     local queue = Peer.new({
         epoch = 1,
         routes = routes,
-        sendReliable = function () end,
+        sendReliable = function() end,
         maximumReceiveFramesPerStep = 1,
         maximumQueuedFrames = 2,
     })
-    queue:on(1, function () end)
-    queue:on(2, function () end)
+    queue:on(1, function() end)
+    queue:on(2, function() end)
     assert(queue:receive(frame(1, "unreliable", 2), "unreliable"))
     assert(queue:receive(frame(2, "unreliable", 2), "unreliable"))
-    assert(not queue:receive(frame(3, "unreliable", 2), "unreliable"))
-    assert(queue:receive(frame(1), "reliable") and not queue:status().destroyed)
+    assert(
+        not queue:receive(frame(3, "unreliable", 2), "unreliable"),
+        "excess unreliable frame must be rejected"
+    )
+    assert(
+        queue:receive(frame(1), "reliable") and not queue:status().destroyed,
+        "reliable traffic must survive an exhausted unreliable queue"
+    )
     queue:step()
     queue:step()
-    assert(queue:status().receivedReliableSequence == 1)
+    assert(
+        queue:status().receivedReliableSequence == 1,
+        "reliable sequence must advance after queued work drains"
+    )
     queue:destroy()
     local now = 0
     local gate = Admission.new({
-        clock = function ()
+        clock = function()
             return now
         end,
         routeLimits = { [2] = { sharedRoutePackets = { capacity = 1024, refillPerSecond = 660 } } },
@@ -91,13 +106,19 @@ return function ()
             assert(gate:admit(p, 2, 32, 1, true))
         end
     end
-    assert(gate:status().accepted == 18000)
+    assert(
+        gate:status().accepted == 18000,
+        "configured shared route budget must admit all 18000 packets"
+    )
     local cfg, reason =
         Config.peer({ epoch = 1, routes = routes, ingressPackets = { capacity = "bad" } })
-    assert(cfg == nil and reason == "invalid_peer_limits")
+    assert(
+        cfg == nil and reason == "invalid_peer_limits",
+        "malformed ingress limits must return invalid_peer_limits"
+    )
 
     local baseline = Admission.new({
-        clock = function ()
+        clock = function()
             return now
         end,
     })
@@ -118,21 +139,28 @@ return function ()
         { refillPerSecond = -1 },
     }) do
         assert(
-            not pcall(Admission.new, { routeLimits = { [1] = { sharedRoutePackets = limits } } })
+            not pcall(Admission.new, { routeLimits = { [1] = { sharedRoutePackets = limits } } }),
+            "invalid shared route limits must be rejected"
         )
     end
 
     local reserved = Peer.new({
         epoch = 1,
         routes = routes,
-        sendReliable = function () end,
+        sendReliable = function() end,
         ingressPackets = { capacity = 4, refillPerSecond = 0 },
         ingressReliableReserve = 1,
     })
     for n = 1, 3 do
         assert(reserved:receive(frame(n, "unreliable", 2), "unreliable"))
     end
-    assert(not reserved:receive(frame(4, "unreliable", 2), "unreliable"))
-    assert(reserved:receive(frame(1), "reliable") and not reserved:status().destroyed)
+    assert(
+        not reserved:receive(frame(4, "unreliable", 2), "unreliable"),
+        "unreliable traffic must not consume the reliable ingress reserve"
+    )
+    assert(
+        reserved:receive(frame(1), "reliable") and not reserved:status().destroyed,
+        "reserved ingress capacity must admit reliable traffic without retirement"
+    )
     reserved:destroy()
 end

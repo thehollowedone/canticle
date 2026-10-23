@@ -7,7 +7,7 @@ local function signal()
         table.insert(handlers, handler)
         local live = true
         return {
-            Disconnect = function ()
+            Disconnect = function()
                 if not live then
                     return
                 end
@@ -40,7 +40,7 @@ local function bytes(text)
     return out
 end
 
-return function ()
+return function()
     local player = { UserId = 77 }
     local reliable = { OnClientEvent = signal(), OnServerEvent = signal() }
     function reliable:FireServer(frame)
@@ -80,11 +80,11 @@ return function ()
     local manifest = assert(Transport.Manifest.build(routes), "route manifest must build")
     local serverMetrics = Transport.Metrics.new()
     local observed = {}
-    local server = Transport.Remote.server(reliable, unreliable, function ()
+    local server = Transport.Remote.server(reliable, unreliable, function()
         return {
             epoch = 91,
             routes = routes,
-            clock = function ()
+            clock = function()
                 return now
             end,
         }
@@ -95,11 +95,11 @@ return function ()
         players = players,
         stepSignal = heartbeat,
         metrics = serverMetrics,
-        onPeer = function (_, peer)
-            peer:on(1, function (payload)
+        onPeer = function(_, peer)
+            peer:on(1, function(payload)
                 table.insert(observed, buffer.readstring(payload, 0, buffer.len(payload)))
             end)
-            peer:on(2, function () end)
+            peer:on(2, function() end)
         end,
     })
     local premature = assert(Transport.Frame.encode({
@@ -138,11 +138,11 @@ return function ()
         handshakeRemote = handshake,
         handshakeChallenge = 123,
         metrics = clientMetrics,
-        clock = function ()
+        clock = function()
             return now
         end,
         stepSignal = heartbeat,
-        bindPeer = function ()
+        bindPeer = function()
             reliable.OnClientEvent:Fire(premature)
         end,
     })
@@ -157,7 +157,7 @@ return function ()
 
     local timedOut = false
     assert(
-        client:request(2, bytes("wait"), 1, function (ok, _, reason)
+        client:request(2, bytes("wait"), 1, function(ok, _, reason)
             timedOut = not ok and reason == "timeout"
         end),
         "adapter request must open"
@@ -217,11 +217,11 @@ return function ()
     local budgetMetrics = Transport.Metrics.new()
     local budgetObserved = 0
     local customAdmissions = 0
-    local budgetServer = Transport.Remote.server(budgetReliable, nil, function ()
+    local budgetServer = Transport.Remote.server(budgetReliable, nil, function()
         return {
             routes = routes,
             metrics = budgetMetrics,
-            admit = function ()
+            admit = function()
                 customAdmissions += 1
                 return true
             end,
@@ -233,13 +233,13 @@ return function ()
         players = budgetPlayers,
         stepSignal = false,
         admission = {
-            clock = function ()
+            clock = function()
                 return 0
             end,
             rawBytes = { capacity = buffer.len(budgetFirst), refillPerSecond = 0 },
         },
-        onPeer = function (_, peer)
-            peer:on(1, function ()
+        onPeer = function(_, peer)
+            peer:on(1, function()
                 budgetObserved += 1
             end)
         end,
@@ -288,7 +288,7 @@ return function ()
     local failedHandshake = { OnClientEvent = signal(), OnServerEvent = signal() }
     function failedHandshake:FireClient() end
     local failureMetrics = Transport.Metrics.new()
-    local failedServer = Transport.Remote.server(failedReliable, nil, function ()
+    local failedServer = Transport.Remote.server(failedReliable, nil, function()
         return nil
     end, {
         handshakeRemote = failedHandshake,
@@ -320,7 +320,7 @@ return function ()
         handshakeRemote = mismatchHandshake,
         handshakeChallenge = 900,
         maximumHandshakeAttempts = 1,
-        handshakeWait = function () end,
+        handshakeWait = function() end,
         stepSignal = false,
         metrics = mismatchMetrics,
     })
@@ -349,7 +349,7 @@ return function ()
         handshakeChallenge = 901,
         maximumHandshakeAttempts = 1,
         maximumOutstandingRequests = 0,
-        handshakeWait = function () end,
+        handshakeWait = function() end,
         stepSignal = false,
         metrics = creationMetrics,
     })
@@ -382,18 +382,18 @@ return function ()
 
         local abandonedHeartbeat = signal()
         local boundPeer
-        local initializing = coroutine.create(function ()
+        local initializing = coroutine.create(function()
             Transport.Remote.client(abandonedReliable, abandonedUnreliable, {
                 routes = routes,
                 manifest = manifest,
                 handshakeRemote = abandonedHandshake,
                 handshakeChallenge = 902,
                 maximumHandshakeAttempts = 1,
-                handshakeWait = function ()
+                handshakeWait = function()
                     coroutine.yield()
                 end,
                 stepSignal = abandonedHeartbeat,
-                bindPeer = function (peer)
+                bindPeer = function(peer)
                     boundPeer = peer
                     if phase == "binding" then
                         coroutine.yield()
@@ -431,7 +431,7 @@ return function ()
 
     local completedHeartbeat = signal()
     local completedPeer, completedClose
-    local completedOwner = coroutine.create(function ()
+    local completedOwner = coroutine.create(function()
         completedPeer, completedClose = Transport.Remote.client(completedReliable, nil, {
             routes = routes,
             manifest = manifest,
@@ -448,7 +448,10 @@ return function ()
         "a completed initialization transfers ownership instead of abandoning the live peer"
     )
     completedClose()
-    assert(completedHeartbeat:Count() == 0 and completedReliable.OnClientEvent:Count() == 0)
+    assert(
+        completedHeartbeat:Count() == 0 and completedReliable.OnClientEvent:Count() == 0,
+        "completed client cleanup must release heartbeat and reliable event connections"
+    )
 
     local invalidHandshake = { OnClientEvent = signal() }
     local invalidCreated = pcall(Transport.Remote.client, completedReliable, nil, {
@@ -470,7 +473,7 @@ return function ()
     local raceHandshake = { OnClientEvent = signal(), OnServerEvent = signal() }
     function raceHandshake:FireClient() end
     local entered = false
-    local raceServer = Transport.Remote.server(raceReliable, nil, function ()
+    local raceServer = Transport.Remote.server(raceReliable, nil, function()
         entered = true
         coroutine.yield()
         return { routes = routes }
@@ -482,7 +485,7 @@ return function ()
         players = false,
     })
     raceHandshake.OnServerEvent:Fire(player, 555, manifest.version, manifest.fingerprint)
-    local setup = coroutine.create(function ()
+    local setup = coroutine.create(function()
         raceHandshake.OnServerEvent:Fire(
             player,
             555,
@@ -510,7 +513,7 @@ return function ()
     end
 
     local generationPeers = {}
-    local generationServer = Transport.Remote.server(generationReliable, nil, function ()
+    local generationServer = Transport.Remote.server(generationReliable, nil, function()
         return { routes = routes }
     end, {
         handshakeRemote = generationHandshake,
@@ -518,7 +521,7 @@ return function ()
         initialEpoch = 300,
         stepSignal = false,
         players = false,
-        onPeer = function (_, peer)
+        onPeer = function(_, peer)
             table.insert(generationPeers, peer)
             coroutine.yield()
         end,
@@ -530,7 +533,7 @@ return function ()
             manifest.version,
             manifest.fingerprint
         )
-        local thread = coroutine.create(function ()
+        local thread = coroutine.create(function()
             generationHandshake.OnServerEvent:Fire(
                 player,
                 challenge,
@@ -581,7 +584,7 @@ return function ()
         end
     end
 
-    local departureServer = Transport.Remote.server(departureReliable, nil, function ()
+    local departureServer = Transport.Remote.server(departureReliable, nil, function()
         return { routes = routes }
     end, {
         handshakeRemote = departureHandshake,
@@ -601,13 +604,13 @@ return function ()
     local departingPeer = departureServer:findPeer(player)
     local departureEntered = false
     assert(
-        departingPeer:request(2, bytes("pending"), 1, function ()
+        departingPeer:request(2, bytes("pending"), 1, function()
             departureEntered = true
             coroutine.yield()
         end),
         "old generation must have a pending request cleanup callback"
     )
-    local replacing = coroutine.create(function ()
+    local replacing = coroutine.create(function()
         departureHandshake.OnServerEvent:Fire(player, 701, manifest.version, manifest.fingerprint)
     end)
     assert(
@@ -635,12 +638,12 @@ return function ()
         "yielding old cleanup must not retire or replace the newest active session"
     )
     assert(
-        newestPeer:request(2, bytes("epoch pending"), 1, function ()
+        newestPeer:request(2, bytes("epoch pending"), 1, function()
             coroutine.yield()
         end),
         "epoch fixture must attempt to yield during cleanup"
     )
-    local epochReplacement = coroutine.create(function ()
+    local epochReplacement = coroutine.create(function()
         departureHandshake.OnServerEvent:Fire(player, 710, manifest.version, manifest.fingerprint)
     end)
     assert(coroutine.resume(epochReplacement), "replacement epoch must be reserved independently")
@@ -671,12 +674,12 @@ return function ()
     )
 
     assert(
-        newestPeer:request(2, bytes("remove pending"), 1, function ()
+        newestPeer:request(2, bytes("remove pending"), 1, function()
             coroutine.yield()
         end),
         "removal fixture must have a yielding cleanup callback"
     )
-    local removing = coroutine.create(function ()
+    local removing = coroutine.create(function()
         departureServer:removePeer(player)
     end)
     assert(coroutine.resume(removing), "player removal must complete despite yielding cleanup")
@@ -698,12 +701,12 @@ return function ()
     )
 
     assert(
-        rejoinedPeer:request(2, bytes("shutdown pending"), 1, function ()
+        rejoinedPeer:request(2, bytes("shutdown pending"), 1, function()
             coroutine.yield()
         end),
         "shutdown fixture must have a yielding cleanup callback"
     )
-    local shuttingDown = coroutine.create(function ()
+    local shuttingDown = coroutine.create(function()
         departureHandshake.OnServerEvent:Fire(player, 704, manifest.version, manifest.fingerprint)
     end)
     assert(

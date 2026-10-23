@@ -185,7 +185,7 @@ local function run()
         end
 
         local proxy = setmetatable({}, {
-            __index = function (_, key)
+            __index = function(_, key)
                 row.f1 = 7
                 return row[key]
             end,
@@ -229,9 +229,9 @@ local function run()
                 outer[1], outer[3] = repeated, repeated
                 assert(#outer == 3, "regression requires a raw array hole")
                 setmetatable(outer, {
-                    __iter = function ()
+                    __iter = function()
                         local key = 0
-                        return function ()
+                        return function()
                             key += 1
                             if key <= 3 then
                                 return key, true
@@ -240,7 +240,7 @@ local function run()
                             return nil
                         end
                     end,
-                    __index = function (_, key)
+                    __index = function(_, key)
                         if key == 2 then
                             accesses += 1
                             if accesses > 1 then
@@ -356,7 +356,7 @@ local function run()
                 schemaFingerprint = boundCodec.fingerprint,
             },
         },
-        sendReliable = function ()
+        sendReliable = function()
             calls += 1
         end,
     })
@@ -365,7 +365,7 @@ local function run()
     local ok, reason = peer:sendCompactBatchValues(1, wrong, { { true } })
     assert(not ok and reason == "schema_mismatch" and calls == 0, "mismatched encoder cannot send")
     assert(
-        not pcall(peer.onBatchValues, peer, 1, wrong, function () end),
+        not pcall(peer.onBatchValues, peer, 1, wrong, function() end),
         "mismatched decoder cannot bind"
     )
     assert(
@@ -375,7 +375,7 @@ local function run()
     peer:destroy()
 end
 
-return function ()
+return function()
     for _, native in { false, true } do
         codegenEnabled = native
         run()

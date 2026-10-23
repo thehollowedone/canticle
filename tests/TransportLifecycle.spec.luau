@@ -6,7 +6,7 @@ local function bytes(text)
     return out
 end
 
-return function ()
+return function()
     local now = 0
     local sent = {}
     local metrics = Transport.Metrics.new()
@@ -23,24 +23,24 @@ return function ()
         },
         maximumOutstandingRequests = 4,
         maximumRequestTimeout = 10,
-        clock = function ()
+        clock = function()
             return now
         end,
         metrics = metrics,
-        sendReliable = function (frame)
+        sendReliable = function(frame)
             table.insert(sent, frame)
         end,
     })
 
     local cancelReason = nil
     local firstId = assert(
-        peer:request(1, bytes("first"), 5, function (success, _, reason)
+        peer:request(1, bytes("first"), 5, function(success, _, reason)
             assert(not success, "cancel callback must report failure")
             cancelReason = reason
         end),
         "first request must open"
     )
-    local blocked, blockedReason = peer:request(1, bytes("blocked"), 5, function ()
+    local blocked, blockedReason = peer:request(1, bytes("blocked"), 5, function()
         error("capacity-rejected request callback must not run")
     end)
     assert(
@@ -54,7 +54,7 @@ return function ()
 
     local timeoutReason = nil
     assert(
-        peer:request(1, bytes("timeout"), 5, function (success, _, reason)
+        peer:request(1, bytes("timeout"), 5, function(success, _, reason)
             assert(not success, "timeout callback must report failure")
             timeoutReason = reason
         end),
@@ -67,7 +67,7 @@ return function ()
 
     local destroyReason = nil
     assert(
-        peer:request(1, bytes("destroy"), 5, function (success, _, reason)
+        peer:request(1, bytes("destroy"), 5, function(success, _, reason)
             assert(not success, "destroy callback must report failure")
             destroyReason = reason
         end),
@@ -94,16 +94,16 @@ return function ()
                 maximumPayloadBytes = 128,
             },
         },
-        clock = function ()
+        clock = function()
             return math.huge
         end,
-        sendReliable = function () end,
+        sendReliable = function() end,
     })
     local invalidClockRequest, invalidClockReason = invalidClockPeer:request(
         1,
         bytes("clock"),
         1,
-        function ()
+        function()
             error("invalid-clock request callback must not run")
         end
     )
@@ -129,14 +129,14 @@ return function ()
                 maximumPayloadBytes = 128,
             },
         },
-        clock = function ()
+        clock = function()
             return now
         end,
-        sendReliable = function () end,
+        sendReliable = function() end,
         metrics = lateMetrics,
     })
     local outboundId = assert(
-        latePeer:request(1, bytes("outbound"), 1, function () end),
+        latePeer:request(1, bytes("outbound"), 1, function() end),
         "outbound collision fixture must open"
     )
     local inboundCancel = assert(
@@ -171,7 +171,7 @@ return function ()
     )
     local originalMaterialize = Transport.Frame.materialize
     local materialized = 0
-    Transport.Frame.materialize = function (...)
+    Transport.Frame.materialize = function(...)
         materialized += 1
         return originalMaterialize(...)
     end
@@ -188,7 +188,7 @@ return function ()
         "one late response must increment the late metric exactly once"
     )
     local inboundObserved = false
-    latePeer:on(1, function ()
+    latePeer:on(1, function()
         inboundObserved = true
     end)
     local afterLate = assert(
@@ -214,12 +214,12 @@ return function ()
         routes = {
             { id = 1, lane = "reliable", maximumFrameBytes = 256, maximumPayloadBytes = 128 },
         },
-        sendReliable = function (frame)
+        sendReliable = function(frame)
             coroutine.yield("sending")
             table.insert(emitted, frame)
         end,
     })
-    local sendThread = coroutine.create(function ()
+    local sendThread = coroutine.create(function()
         return sendPeer:send(1, bytes("first"))
     end)
     local resumed, marker = coroutine.resume(sendThread)
@@ -242,9 +242,9 @@ return function ()
         routes = {
             { id = 1, lane = "reliable", maximumFrameBytes = 256, maximumPayloadBytes = 128 },
         },
-        sendReliable = function () end,
+        sendReliable = function() end,
     })
-    receivePeer:on(1, function (payload)
+    receivePeer:on(1, function(payload)
         local value = buffer.readstring(payload, 0, buffer.len(payload))
         table.insert(receiveOrder, value)
         if value == "first" then
@@ -271,7 +271,7 @@ return function ()
         }),
         "second serialized receive must encode"
     )
-    local receiveThread = coroutine.create(function ()
+    local receiveThread = coroutine.create(function()
         return receivePeer:receive(firstReceive)
     end)
     resumed, marker = coroutine.resume(receiveThread)
@@ -288,7 +288,7 @@ return function ()
 
     local runtimeCodec = assert(Transport.Codec.compile({ type = "integer", min = 0, max = 255 }))
     local suspendedCodec = table.clone(runtimeCodec)
-    suspendedCodec.decodeCompactBatch = function (_, ...)
+    suspendedCodec.decodeCompactBatch = function(_, ...)
         coroutine.yield("decoding")
         return runtimeCodec:decodeCompactBatch(...)
     end
@@ -305,9 +305,9 @@ return function ()
                 schemaFingerprint = runtimeCodec.fingerprint,
             },
         },
-        sendReliable = function () end,
+        sendReliable = function() end,
     })
-    decodingPeer:onBatchValues(1, suspendedCodec, function ()
+    decodingPeer:onBatchValues(1, suspendedCodec, function()
         retiredCalls += 1
     end)
     local decodingFrame = assert(Transport.Frame.encode({
@@ -319,7 +319,7 @@ return function ()
         compactBatch = true,
         payload = assert(runtimeCodec:encodeCompactBatch({ 1 })),
     }))
-    local decodingThread = coroutine.create(function ()
+    local decodingThread = coroutine.create(function()
         return decodingPeer:receive(decodingFrame)
     end)
     local started, decodingMarker = coroutine.resume(decodingThread)
