@@ -30,7 +30,7 @@ Install the tools pinned in `rokit.toml`, then:
 
 ```powershell
 powershell -NoProfile -File tools/check-types.ps1
-luneblox run tests/run.luau
+lune run tests/run.luau
 rojo build default.project.json -o build/Canticle.rbxm
 ```
 

@@ -127,7 +127,7 @@ Unreliable frames are capped at 1,000 bytes including headers; batching and comp
 From a source checkout:
 
 ```powershell
-luneblox run tools/generate-codec.luau -- schema.json generated
+lune run tools/generate-codec.luau -- schema.json generated
 ```
 
 Supported schemas: packed Boolean arrays or arrays of records with 1–16 required unsigned byte fields. Output:

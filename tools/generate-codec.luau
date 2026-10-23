@@ -7,7 +7,7 @@ local first = if process.args[1] == "--" then 2 else 1
 local input, directory = process.args[first], process.args[first + 1]
 assert(
     input and directory,
-    "usage: luneblox run tools/generate-codec.luau -- schema.json output-directory"
+    "usage: lune run tools/generate-codec.luau -- schema.json output-directory"
 )
 local schema = serde.decode("json", fs.readFile(input))
 local client, clientReason = ClientCodecGenerator.generate(
