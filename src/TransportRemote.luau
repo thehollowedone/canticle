@@ -55,7 +55,7 @@ local function connect(signal: any, callback: any): any
         return nil
     end
 
-    local ok, connection = pcall(function ()
+    local ok, connection = pcall(function()
         return signal:Connect(callback)
     end)
     return if ok then connection else nil
@@ -129,7 +129,7 @@ function Remote.client(
     end
     -- The caller cannot return a disposer if initialization is cancelled.
     -- Reuse normal lifecycle stepping to release that abandoned ownership.
-    stepConnection = connect(stepSignal, function ()
+    stepConnection = connect(stepSignal, function()
         if state ~= "OPEN" then
             return
         end
@@ -142,7 +142,7 @@ function Remote.client(
             peer:step()
         end
     end)
-    handshakeConnection = handshake.OnClientEvent:Connect(function (...)
+    handshakeConnection = handshake.OnClientEvent:Connect(function(...)
         if state ~= "OPEN" then
             return
         end
@@ -182,7 +182,7 @@ function Remote.client(
         end
     end)
     local waitForRetry = options.handshakeWait
-        or function ()
+        or function()
             if script then
                 task.wait(0.5)
             end
@@ -206,7 +206,7 @@ function Remote.client(
     local config = table.clone(options)
     config.epoch = epoch
     local suppliedTerminate = config.onTerminate
-    config.onTerminate = function (reason)
+    config.onTerminate = function(reason)
         if state == "OPEN" then
             -- One terminal control message, never replay application frames.
             close()
@@ -224,7 +224,7 @@ function Remote.client(
             Callbacks.synchronous(suppliedTerminate, reason)
         end
     end
-    config.sendReliable = function (frame)
+    config.sendReliable = function(frame)
         if not confirmed then
             observe(metrics, nil, "pre_ready_frame_rejected")
             error("transport peer is not ready")
@@ -233,7 +233,7 @@ function Remote.client(
     end
 
     if unreliable then
-        config.sendUnreliable = function (frame)
+        config.sendUnreliable = function(frame)
             if not confirmed then
                 observe(metrics, nil, "pre_ready_frame_rejected")
                 error("transport peer is not ready")
@@ -250,7 +250,7 @@ function Remote.client(
         error("transport peer creation failed: " .. tostring(result))
     end
     peer = result
-    reliableConnection = reliable.OnClientEvent:Connect(function (frame)
+    reliableConnection = reliable.OnClientEvent:Connect(function(frame)
         if state == "OPEN" and confirmed then
             peer:receive(frame, "reliable")
         elseif state == "OPEN" then
@@ -258,7 +258,7 @@ function Remote.client(
         end
     end)
     unreliableConnection = if unreliable
-        then unreliable.OnClientEvent:Connect(function (frame)
+        then unreliable.OnClientEvent:Connect(function(frame)
             if state == "OPEN" and confirmed then
                 peer:receive(frame, "unreliable")
             elseif state == "OPEN" then
@@ -456,7 +456,7 @@ function Remote.server(
         end
 
         local suppliedTerminate = config.onTerminate
-        config.onTerminate = function (reason)
+        config.onTerminate = function(reason)
             if state == "OPEN" and sessions[player] == token.session then
                 token.session.active = false
                 token.session.terminal = true
@@ -469,7 +469,7 @@ function Remote.server(
                 Callbacks.synchronous(suppliedTerminate, reason)
             end
         end
-        config.acquireReceiveWork = function ()
+        config.acquireReceiveWork = function()
             if receiveRemaining <= 0 then
                 return false
             end
@@ -486,7 +486,7 @@ function Remote.server(
         end
 
         local suppliedAdmit: ((number, number, number) -> (boolean, string?))? = config.admit
-        config.admit = function (route: number, rawBytes: number, expandedBytes: number)
+        config.admit = function(route: number, rawBytes: number, expandedBytes: number)
             local admitted, reason = admission:admit(
                 player,
                 route,
@@ -505,7 +505,7 @@ function Remote.server(
             return true, nil
         end
         config.epoch = epoch
-        config.sendReliable = function (frame)
+        config.sendReliable = function(frame)
             if
                 state == "OPEN"
                 and peers[player] ~= nil
@@ -522,7 +522,7 @@ function Remote.server(
         local unreliableRemote = unreliable
 
         if unreliableRemote then
-            config.sendUnreliable = function (frame)
+            config.sendUnreliable = function(frame)
                 if
                     state == "OPEN"
                     and peers[player] ~= nil
@@ -659,7 +659,7 @@ function Remote.server(
         }
     end
 
-    local handshakeConnection = handshake.OnServerEvent:Connect(function (player, ...)
+    local handshakeConnection = handshake.OnServerEvent:Connect(function(player, ...)
         if state ~= "OPEN" then
             return
         end
@@ -792,7 +792,7 @@ function Remote.server(
         )
     end)
 
-    local reliableConnection = reliable.OnServerEvent:Connect(function (player, frame)
+    local reliableConnection = reliable.OnServerEvent:Connect(function(player, frame)
         local session = sessions[player]
         local peer = if state == "OPEN" and session and session.active then peers[player] else nil
 
@@ -803,7 +803,7 @@ function Remote.server(
         end
     end)
     local unreliableConnection = if unreliable
-        then unreliable.OnServerEvent:Connect(function (player, frame)
+        then unreliable.OnServerEvent:Connect(function(player, frame)
             local session = sessions[player]
             local peer = if state == "OPEN"
                     and session
@@ -824,11 +824,11 @@ function Remote.server(
     end
 
     local playerConnection = if players
-        then connect(players.PlayerRemoving, function (player)
+        then connect(players.PlayerRemoving, function(player)
             handle:removePeer(player)
         end)
         else nil
-    local stepConnection = connect(settings.stepSignal or defaultHeartbeat(), function ()
+    local stepConnection = connect(settings.stepSignal or defaultHeartbeat(), function()
         handle:step()
     end)
 
@@ -858,7 +858,7 @@ function Remote.server(
     end
 
     return setmetatable(handle, {
-        __call = function (value)
+        __call = function(value)
             value:destroy()
         end,
     })

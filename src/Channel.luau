@@ -57,7 +57,7 @@ function Channel.bind(peer: any, routeId: number, codec: Codec, responseCodec: C
             type(callback) == "function" and type(codec.decode) == "function",
             "channel decoder/callback required"
         )
-        return peer:on(routeId, function (payload, context)
+        return peer:on(routeId, function(payload, context)
             local ok, value, reason = codec:decode(payload)
 
             if ok then
@@ -86,7 +86,7 @@ function Channel.bind(peer: any, routeId: number, codec: Codec, responseCodec: C
             return nil, reason
         end
 
-        return peer:request(routeId, payload, timeout, function (ok, bytes, failure)
+        return peer:request(routeId, payload, timeout, function(ok, bytes, failure)
             if not ok then
                 callback(false, nil, failure)
                 return

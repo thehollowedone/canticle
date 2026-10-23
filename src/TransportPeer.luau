@@ -189,9 +189,9 @@ function Peer.new(options: any): PeerState
     local value: PeerState = setmetatable(data, Impl)
 
     if config.egress then
-        value.egress = Egress.new(config.egress, clock, function (event, bytes)
+        value.egress = Egress.new(config.egress, clock, function(event, bytes)
             metric(value, "egress", event, bytes)
-        end, function (reason: string)
+        end, function(reason: string)
             value:_terminate(reason)
         end)
     end
@@ -273,7 +273,7 @@ function Impl.onCancel(self: PeerState, route: number, fn: any): () -> ()
     )
     self.cancelListeners[route] = fn
     local live = true
-    return function ()
+    return function()
         if live and self.cancelListeners[route] == fn then
             self.cancelListeners[route] = nil
         end
@@ -285,7 +285,7 @@ function Impl.on(self: PeerState, route: number, fn: any): () -> ()
     assert(not self.destroyed and self.routes[route] and type(fn) == "function", "invalid listener")
     self.listeners[route] = fn
     local live = true
-    return function ()
+    return function()
         if live and self.listeners[route] == fn then
             self.listeners[route] = nil
         end
@@ -310,7 +310,7 @@ function Impl.onBatchValues(self: PeerState, route: number, codec: any, fn: any)
     local entry = { codec = codec, callback = fn }
     self.batchListeners[route] = entry
     local live = true
-    return function ()
+    return function()
         if live and self.batchListeners[route] == entry then
             self.batchListeners[route] = nil
         end
@@ -377,7 +377,7 @@ function Impl._runReceive(self: PeerState, callback: () -> (boolean, string?)): 
         end
     end
     operation.complete = complete
-    local worker = coroutine.create(function ()
+    local worker = coroutine.create(function()
         local result = table.pack(pcall(callback))
 
         if result[1] then
@@ -1168,13 +1168,13 @@ function Impl.receive(self: PeerState, frame: any, carrier: string?): (boolean, 
             return true, "queued"
         end
 
-        return self:_runReceive(function ()
+        return self:_runReceive(function()
             self:_drainReceiveQueue(self.maximumReceiveFramesPerStep)
             return true, "queued"
         end)
     end
 
-    return self:_runReceive(function ()
+    return self:_runReceive(function()
         self.receiveRemaining -= 1
         local called, accepted, reason = safe(self._receiveNow, self, frame, carrier)
         local firstAccepted = if called then accepted else false
@@ -1212,7 +1212,7 @@ function Impl.step(self: PeerState): number
     end
 
     if not self.receiving and queuedFrames(self) > 0 then
-        self:_runReceive(function ()
+        self:_runReceive(function()
             self:_drainReceiveQueue(self.maximumReceiveFramesPerStep)
             return true, "queued"
         end)
