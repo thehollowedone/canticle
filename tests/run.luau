@@ -3,6 +3,7 @@ local suites = {
     require("./TransportMemoryLifecycle.spec"),
     require("./TransportRecoveryReview.spec"),
     require("./TransportRecovery.spec"),
+    require("./DecodedExpansion.spec"),
     require("./TransportCodec.spec"),
     require("./TransportAdmission.spec"),
     require("./TransportCore.spec"),

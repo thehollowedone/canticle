@@ -48,9 +48,10 @@ function Generator.generate(spec, options)
     add("--!strict\n--!native\n--!optimize 2")
     add(
         string.format(
-            "local Encoder = { maximumBytes = %d, fingerprint = %d, validatesOutgoing = %s }",
+            "local Encoder = { maximumBytes = %d, fingerprint = %d, maximumDecodedValues = %d, validatesOutgoing = %s }",
             codec.maximumBytes,
             codec.fingerprint,
+            codec.maximumDecodedValues,
             tostring(checked)
         )
     )
@@ -135,6 +136,9 @@ function Generator.generate(spec, options)
         "    if type(values)~='table' then return nil,'invalid_batch' end\n    local count=#values\n    local maxItems=if limits and limits.maximumItems then limits.maximumItems else 64\n    local maxItem=if limits and limits.maximumItemBytes then limits.maximumItemBytes else 65535\n    local maxPayload=if limits and limits.maximumPayloadBytes then limits.maximumPayloadBytes else 1048576\n    if count<1 or count>maxItems or count>65535 then return nil,'batch_item_count' end\n    local keys=0\n    for key in values do\n        if type(key)~='number' or key~=math.floor(key) or key<1 or key>count then return nil,'invalid_batch' end\n        keys+=1\n    end\n    if keys~=count then return nil,'invalid_batch' end"
     )
     add(
+        "    local maximumWork=if limits and limits.maximumDecodedValues~=nil then limits.maximumDecodedValues else 262144\n    if type(maximumWork)~='number' or maximumWork~=math.floor(maximumWork) or maximumWork<1 or maximumWork>262144 or count>maximumWork then return nil,'decoded_work_limit' end\n    local remainingWork=maximumWork-count"
+    )
+    add(
         "    local sizes=table.create(count)\n    local lengths=table.create(count)\n    local seen={}\n    local duplicates={}\n    local repeated=false\n    local total=2"
     )
     add(
@@ -142,6 +146,9 @@ function Generator.generate(spec, options)
     )
     add(
         `        if length<{spec.minLength or 0} or length>{spec.maxLength} then return nil,'invalid_array' end`
+    )
+    add(
+        `        local itemWork=1+length*{if packed then 1 else 1 + width}\n        if itemWork>remainingWork then return nil,'decoded_work_limit' end\n        remainingWork-=itemWork`
     )
     add(
         `        local size={if packed then "math.ceil(length/8)" else `length*{width}`}+{if fixed

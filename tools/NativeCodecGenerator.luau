@@ -91,9 +91,10 @@ function Generator.generate(spec)
     add("--!native")
     add(
         string.format(
-            "local Decoder = { maximumBytes = %d, fingerprint = %d }",
+            "local Decoder = { maximumBytes = %d, fingerprint = %d, maximumDecodedValues = %d }",
             codec.maximumBytes,
-            codec.fingerprint
+            codec.fingerprint,
+            codec.maximumDecodedValues
         )
     )
     add("function Decoder:decodeBatch(data, limits, region)")
@@ -119,6 +120,13 @@ function Generator.generate(spec)
     )
     add("    if count < 1 or count > maximumItems then return false, nil, 'batch_item_count' end")
     add("    if length > maximumPayloadBytes then return false, nil, 'batch_too_large' end")
+    add(
+        "    local maximumWork = if limits and limits.maximumDecodedValues ~= nil then limits.maximumDecodedValues else 262144"
+    )
+    add(
+        "    if type(maximumWork) ~= 'number' or maximumWork ~= math.floor(maximumWork) or maximumWork < 1 or maximumWork > 262144 or count > maximumWork then return false, nil, 'decoded_work_limit' end"
+    )
+    add("    local remainingWork = maximumWork - count")
     add("    local values = table.create(count)")
     add("    local offset = start + 2")
     add("    for itemIndex = 1, count do")
@@ -165,6 +173,9 @@ function Generator.generate(spec)
         add(
             "        if offset + byteCount ~= itemFinish then return false, nil, 'invalid_batch_item' end"
         )
+        add(`        local itemWork = 1 + recordCount * {if packed then 1 else 1 + #fields}`)
+        add("        if itemWork > remainingWork then return false, nil, 'decoded_work_limit' end")
+        add("        remainingWork -= itemWork")
         add("        local records = table.create(recordCount)")
         add("        local fullBytes = math.floor(recordCount / 8)")
         add("        for byteIndex = 0, fullBytes - 1 do")
@@ -191,6 +202,9 @@ function Generator.generate(spec)
         add(
             `        if offset + recordCount * {#fields} ~= itemFinish then return false, nil, 'invalid_batch_item' end`
         )
+        add(`        local itemWork = 1 + recordCount * {if packed then 1 else 1 + #fields}`)
+        add("        if itemWork > remainingWork then return false, nil, 'decoded_work_limit' end")
+        add("        remainingWork -= itemWork")
         add("        local records = table.create(recordCount)")
         add("        for recordIndex = 1, recordCount do")
         for index, field in ipairs(fields) do
@@ -239,6 +253,13 @@ function Generator.generate(spec)
     )
     add("    if count < 1 or count > maximumItems then return false, nil, 'batch_item_count' end")
     add("    if length > maximumPayloadBytes then return false, nil, 'batch_too_large' end")
+    add(
+        "    local maximumWork = if limits and limits.maximumDecodedValues ~= nil then limits.maximumDecodedValues else 262144"
+    )
+    add(
+        "    if type(maximumWork) ~= 'number' or maximumWork ~= math.floor(maximumWork) or maximumWork < 1 or maximumWork > 262144 or count > maximumWork then return false, nil, 'decoded_work_limit' end"
+    )
+    add("    local remainingWork = maximumWork - count")
     add("    local values = table.create(count)")
     add("    local offset = start + 2")
     add("    for itemIndex = 1, count do")
@@ -279,6 +300,9 @@ function Generator.generate(spec)
         add(
             "        if offset > finish - byteCount or offset + byteCount - itemStart > maximumItemBytes then return false, nil, 'invalid_batch_item' end"
         )
+        add(`        local itemWork = 1 + recordCount * {if packed then 1 else 1 + #fields}`)
+        add("        if itemWork > remainingWork then return false, nil, 'decoded_work_limit' end")
+        add("        remainingWork -= itemWork")
         add("        local records = table.create(recordCount)")
         add("        local fullBytes = math.floor(recordCount / 8)")
         add("        for byteIndex = 0, fullBytes - 1 do")
@@ -306,6 +330,9 @@ function Generator.generate(spec)
         add(
             "        if offset > finish - byteCount or offset + byteCount - itemStart > maximumItemBytes then return false, nil, 'invalid_batch_item' end"
         )
+        add(`        local itemWork = 1 + recordCount * {if packed then 1 else 1 + #fields}`)
+        add("        if itemWork > remainingWork then return false, nil, 'decoded_work_limit' end")
+        add("        remainingWork -= itemWork")
         add("        local records = table.create(recordCount)")
         add("        for recordIndex = 1, recordCount do")
         for index, field in ipairs(fields) do

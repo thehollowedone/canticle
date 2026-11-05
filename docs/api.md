@@ -4,7 +4,7 @@ Require the Canticle package root. Compile schemas and routes once at startup; u
 
 ## Schemas
 
-`Codec.compile(schema)` returns `codec, nil` or `nil, reason`. A codec exposes `fingerprint` and `maximumBytes`.
+`Codec.compile(schema)` returns `codec, nil` or `nil, reason`. A codec exposes `fingerprint`, `maximumBytes` and `maximumDecodedValues`. Schemas whose worst-case decoded traversal exceeds 65,536 values are rejected with `schema_decoded_too_large`, including nested arrays of zero-byte enums or empty records. This counts containers, primitive values and absent optional-field visits; it is a work bound, not a heap-byte estimate.
 
 | Type | Fields |
 | --- | --- |
@@ -25,7 +25,7 @@ Field order, bounds, and encoding affect compatibility. Optional fields use a pr
 | `encodeBatch(values, limits?)` / `encodeCompactBatch(values, limits?)` | `buffer?, reason?` |
 | `decodeBatch(bytes, limits?)` / `decodeCompactBatch(bytes, limits?)` | `ok, values?, reason?` |
 
-Batch limits: `maximumItems`, `maximumItemBytes`, `maximumPayloadBytes`. Compact batches omit item-length headers and require route opt-in.
+Batch limits: `maximumItems`, `maximumItemBytes`, `maximumPayloadBytes`, `maximumDecodedValues`. Each ordinary or compact batch shares a hard 262,144-value allowance, including its outer slots. `maximumDecodedValues` may lower that allowance (integer 1 through 262,144); exceeding it returns `decoded_work_limit` before the next allocation or traversal. Generated client encoders (including trusted mode) and native decoders enforce the same allowance. Accepted schemas keep their existing fingerprints and wire format. Compact batches omit item-length headers and require route opt-in.
 
 ## Routes and remotes
 
@@ -132,8 +132,8 @@ lune run tools/generate-codec.luau -- schema.json generated
 
 Supported schemas: packed Boolean arrays or arrays of records with 1–16 required unsigned byte fields. Output:
 
-- `Client.luau`: checked `encodeBatch`, `encodeCompactBatch`, `fingerprint`, `maximumBytes`, `validatesOutgoing`.
-- `Server.luau`: bounded `decodeBatch`, `decodeCompactBatch`, `fingerprint`, `maximumBytes`.
+- `Client.luau`: checked `encodeBatch`, `encodeCompactBatch`, `fingerprint`, `maximumBytes`, `maximumDecodedValues`, `validatesOutgoing`.
+- `Server.luau`: bounded `decodeBatch`, `decodeCompactBatch`, `fingerprint`, `maximumBytes`, `maximumDecodedValues`.
 
 Use the encoder with batch sends and the decoder with `onBatchValues`; single values use the runtime codec. Keep server decoders in ServerScriptService. The separate `generate-client-codec.luau` and `generate-native-codec.luau` tools accept a schema path and an output file.
 

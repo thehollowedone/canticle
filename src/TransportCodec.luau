@@ -2,6 +2,7 @@
 --!optimize 2
 --!native
 
+-- Canonical schema codec for bounded transport payloads.
 local TransportCodec = {}
 
 local MAX_BYTES = 65535
@@ -9,14 +10,22 @@ local MAX_DEPTH = 8
 local MAX_FIELDS = 64
 local MAX_ARRAY = 1024
 local MAX_STRING = 8192
+-- Wire size does not bound decoded expansion (fixed enums/objects may use zero bytes).
+local MAX_VALUES = 65536
+local MAX_BATCH_VALUES = 262144
 local U32 = 4294967295
 local I32_MIN = -2147483648
 local I32_MAX = 2147483647
 
 type Node = { [string]: any }
-type Reader = { data: buffer, offset: number, length: number }
-type BatchLimits =
-    { maximumItems: number?, maximumItemBytes: number?, maximumPayloadBytes: number? }
+type WorkBudget = { remaining: number }
+type Reader = { data: buffer, offset: number, length: number, work: WorkBudget }
+type BatchLimits = {
+    maximumItems: number?,
+    maximumItemBytes: number?,
+    maximumPayloadBytes: number?,
+    maximumDecodedValues: number?,
+}
 
 local function finite(v: any): boolean
     return type(v) == "number" and v == v and v ~= math.huge and v ~= -math.huge
@@ -146,7 +155,7 @@ local function compile(rawSpec: any, depth: number): (Node?, string?)
     local kind = spec.type
 
     if kind == "boolean" then
-        return { kind = kind, maximumBytes = 1, signature = "b" }, nil
+        return { kind = kind, maximumValues = 1, maximumBytes = 1, signature = "b" }, nil
     elseif kind == "number" then
         local width = spec.encoding or "f64"
 
@@ -176,6 +185,7 @@ local function compile(rawSpec: any, depth: number): (Node?, string?)
             encoding = width,
             minimum = minimum,
             maximum = maximum,
+            maximumValues = 1,
             maximumBytes = if width == "f32" then 4 else 8,
             signature = kind .. ":" .. width .. ":" .. tostring(minimum) .. ":" .. tostring(
                 maximum
@@ -212,6 +222,7 @@ local function compile(rawSpec: any, depth: number): (Node?, string?)
             encoding = encoding,
             minimum = minimum,
             maximum = maximum,
+            maximumValues = 1,
             maximumBytes = maxBytes,
             signature = table.concat({ kind, encoding, tostring(minimum), tostring(maximum) }, ":"),
         },
@@ -236,6 +247,7 @@ local function compile(rawSpec: any, depth: number): (Node?, string?)
             minimum = minimum,
             maximum = maximum,
             fixed = fixed,
+            maximumValues = 1,
             maximumBytes = maximum + if fixed then 0 else varUIntBytes(maximum),
             signature = table.concat({ kind, tostring(minimum), tostring(maximum) }, ":"),
         },
@@ -263,6 +275,7 @@ local function compile(rawSpec: any, depth: number): (Node?, string?)
             kind = kind,
             values = copy,
             byValue = byValue,
+            maximumValues = 1,
             maximumBytes = bytes,
             signature = kind .. ":" .. table.concat(copy, "|"),
         },
@@ -293,7 +306,10 @@ local function compile(rawSpec: any, depth: number): (Node?, string?)
         if spec.encoding ~= nil and (spec.encoding ~= "packed" or item.kind ~= "boolean") then
             return nil, "invalid_array_encoding"
         end
-
+        local maximumValues = 1 + maximum * item.maximumValues
+        if maximumValues > MAX_VALUES then
+            return nil, "schema_decoded_too_large"
+        end
         local maximumBytes = (
             if packedBoolean then math.ceil(maximum / 8) else item.maximumBytes * maximum
         ) + if fixed then 0 else varUIntBytes(maximum)
@@ -308,6 +324,7 @@ local function compile(rawSpec: any, depth: number): (Node?, string?)
             fixed = fixed,
             item = item,
             packedBoolean = packedBoolean,
+            maximumValues = maximumValues,
             maximumBytes = maximumBytes,
             signature = if packedBoolean
                 then table.concat(
@@ -331,6 +348,7 @@ local function compile(rawSpec: any, depth: number): (Node?, string?)
         local names = {}
         local optionalCount = 0
         local maximumBytes = 0
+        local maximumValues = 1
         local signatures = {}
 
         for index, sourceField in ipairs(fields) do
@@ -362,6 +380,10 @@ local function compile(rawSpec: any, depth: number): (Node?, string?)
                 optional = optional,
                 optionalIndex = if optional then optionalCount else nil,
             }
+            maximumValues += node.maximumValues
+            if maximumValues > MAX_VALUES then
+                return nil, "schema_decoded_too_large"
+            end
             maximumBytes += node.maximumBytes
             signatures[index] = field.name .. (if optional then "?" else "!") .. node.signature
         end
@@ -376,6 +398,7 @@ local function compile(rawSpec: any, depth: number): (Node?, string?)
             kind = kind,
             fields = out,
             bitmapBytes = bitmapBytes,
+            maximumValues = maximumValues,
             maximumBytes = maximumBytes,
             signature = kind .. "{" .. table.concat(signatures, ",") .. "}",
         },
@@ -385,7 +408,29 @@ local function compile(rawSpec: any, depth: number): (Node?, string?)
     return nil, "unsupported_schema_type"
 end
 
-local function sizeOf(node: Node, value: any): (number?, string?)
+local function charge(work: WorkBudget, count: number): boolean
+    if count > work.remaining then
+        return false
+    end
+    work.remaining -= count
+    return true
+end
+
+local function batchWork(limits: BatchLimits?, count: number): WorkBudget?
+    local maximum = if limits and limits.maximumDecodedValues ~= nil
+        then limits.maximumDecodedValues
+        else MAX_BATCH_VALUES
+    if not integer(maximum) or maximum < 1 or maximum > MAX_BATCH_VALUES or count > maximum then
+        return nil
+    end
+    -- The outer array slots also occupy decoded storage.
+    return { remaining = maximum - count }
+end
+
+local function sizeOf(node: Node, value: any, work: WorkBudget): (number?, string?)
+    if not charge(work, 1) then
+        return nil, "decoded_work_limit"
+    end
     local kind = node.kind
 
     if kind == "boolean" then
@@ -426,8 +471,11 @@ local function sizeOf(node: Node, value: any): (number?, string?)
         if type(value) ~= "table" or #value < node.minimum or #value > node.maximum then
             return nil, "invalid_array"
         end
-
+        if #value > work.remaining then
+            return nil, "decoded_work_limit"
+        end
         if node.packedBoolean then
+            work.remaining -= #value
             for i = 1, #value do
                 if type(value[i]) ~= "boolean" then
                     return nil, "expected_boolean"
@@ -440,7 +488,7 @@ local function sizeOf(node: Node, value: any): (number?, string?)
         local total = if node.fixed then 0 else varUIntBytes(#value)
 
         for i = 1, #value do
-            local itemSize, err = sizeOf(node.item, value[i])
+            local itemSize, err = sizeOf(node.item, value[i], work)
 
             if not itemSize then
                 return nil, err
@@ -463,8 +511,11 @@ local function sizeOf(node: Node, value: any): (number?, string?)
                 if not field.optional then
                     return nil, "missing_field"
                 end
+                if not charge(work, 1) then
+                    return nil, "decoded_work_limit"
+                end
             else
-                local fieldSize, err = sizeOf(field.node, child)
+                local fieldSize, err = sizeOf(field.node, child, work)
 
                 if not fieldSize then
                     return nil, err
@@ -627,6 +678,9 @@ local function need(reader: Reader, count: number): boolean
 end
 
 local function readNode(node: Node, reader: Reader): (any?, string?)
+    if not charge(reader.work, 1) then
+        return nil, "decoded_work_limit"
+    end
     local kind = node.kind
 
     if kind == "boolean" then
@@ -748,8 +802,11 @@ local function readNode(node: Node, reader: Reader): (any?, string?)
         if length < node.minimum or length > node.maximum then
             return nil, "invalid_array_length"
         end
-
+        if length > reader.work.remaining then
+            return nil, "decoded_work_limit"
+        end
         if node.packedBoolean then
+            reader.work.remaining -= length
             local byteLength = math.ceil(length / 8)
 
             if not need(reader, byteLength) then
@@ -829,6 +886,8 @@ local function readNode(node: Node, reader: Reader): (any?, string?)
                     return nil, err
                 end
                 out[field.name] = v
+            elseif not charge(reader.work, 1) then
+                return nil, "decoded_work_limit"
             end
         end
 
@@ -849,7 +908,8 @@ local function hash(text: string): number
     return h
 end
 
--- Compile byte-array writers once to avoid per-field dispatch.
+-- Arrays of required byte fields are common in snapshot traffic. Compile this
+-- shape once so encoding need not recursively dispatch over every field.
 local function byteRecordFields(root: Node): { any }?
     local object: Node = root.item
 
@@ -985,6 +1045,8 @@ local function writeFixedByteArray(
     return offset, nil
 end
 
+-- Validate and pack in one pass instead of recursively validating every bit
+-- and then traversing the same array again to write it.
 local function writePackedBooleanArray(
     out: buffer,
     offset: number,
@@ -1069,7 +1131,8 @@ local function writePackedBooleanArray(
     return offset + math.ceil(count / 8), nil
 end
 
--- Cache only within a call; metatable callbacks can mutate earlier values.
+-- A memo lives only during this synchronous encoding call. Metatables can run
+-- user code that mutates a previously encoded value, so such batches never memo.
 local function plainBatch(values: { any }, records: boolean): boolean
     if getmetatable(values :: any) ~= nil then
         return false
@@ -1179,7 +1242,11 @@ function TransportCodec.compile(spec: any): (any?, string?)
     end
 
     local fingerprint = hash(root.signature)
-    local codec = { fingerprint = fingerprint, maximumBytes = root.maximumBytes }
+    local codec = {
+        fingerprint = fingerprint,
+        maximumBytes = root.maximumBytes,
+        maximumDecodedValues = root.maximumValues,
+    }
     local byteFields: { any }? = byteRecordFields(root)
     local packedBoolean = root.kind == "array" and root.packedBoolean == true
     local byteFieldsFullRange = true
@@ -1199,6 +1266,9 @@ function TransportCodec.compile(spec: any): (any?, string?)
             end
 
             local count = #value
+            if 1 + count * (1 + #byteFields) > MAX_VALUES then
+                return nil, "decoded_work_limit"
+            end
             local prefix = if root.fixed then 0 else varUIntBytes(count)
             local out = buffer.create(prefix + count * #byteFields)
             local offset = if root.fixed then 0 else writeVarUInt(out, 0, count)
@@ -1210,9 +1280,7 @@ function TransportCodec.compile(spec: any): (any?, string?)
 
             return out, nil
         end
-
-        local size, e = sizeOf(root, value)
-
+        local size, e = sizeOf(root, value, { remaining = MAX_VALUES })
         if not size then
             return nil, e
         end
@@ -1264,7 +1332,10 @@ function TransportCodec.compile(spec: any): (any?, string?)
         if keys ~= count then
             return nil, "invalid_batch"
         end
-
+        local work = batchWork(limits, count)
+        if work == nil then
+            return nil, "decoded_work_limit"
+        end
         local total = 2
         local sizes = table.create(count) :: { number }
         local lengths = table.create(count) :: { number }
@@ -1283,6 +1354,11 @@ function TransportCodec.compile(spec: any): (any?, string?)
                 end
 
                 local length = #value
+                local itemWork = 1
+                    + length * (if packedBoolean then 1 else 1 + #(byteFields :: { any }))
+                if not charge(work, itemWork) then
+                    return nil, "decoded_work_limit"
+                end
                 size = (
                     if packedBoolean
                         then math.ceil(length / 8)
@@ -1297,8 +1373,7 @@ function TransportCodec.compile(spec: any): (any?, string?)
                     seen[value] = true
                 end
             else
-                local calculated, sizeError = sizeOf(root, values[i])
-
+                local calculated, sizeError = sizeOf(root, values[i], work)
                 if not calculated then
                     return nil, sizeError
                 end
@@ -1396,7 +1471,12 @@ function TransportCodec.compile(spec: any): (any?, string?)
         end
 
         if byteFields then
-            local reader = { data = data, offset = 0, length = buffer.len(data) }
+            local reader = {
+                data = data,
+                offset = 0,
+                length = buffer.len(data),
+                work = { remaining = MAX_VALUES },
+            }
             local count = root.maximum
 
             if not root.fixed then
@@ -1415,7 +1495,9 @@ function TransportCodec.compile(spec: any): (any?, string?)
             if reader.offset + count * #byteFields ~= reader.length then
                 return false, nil, "truncated"
             end
-
+            if not charge(reader.work, 1 + count * (1 + #byteFields)) then
+                return false, nil, "decoded_work_limit"
+            end
             local value, e =
                 readFixedByteArray(data, reader.offset, count, byteFields, byteFieldsFullRange)
             if not value then
@@ -1424,8 +1506,12 @@ function TransportCodec.compile(spec: any): (any?, string?)
 
             return true, value, nil
         end
-
-        local reader = { data = data, offset = 0, length = buffer.len(data) }
+        local reader = {
+            data = data,
+            offset = 0,
+            length = buffer.len(data),
+            work = { remaining = MAX_VALUES },
+        }
         local value, e = readNode(root, reader)
 
         if e then
@@ -1479,10 +1565,12 @@ function TransportCodec.compile(spec: any): (any?, string?)
         if length > maximumPayloadBytes then
             return false, nil, "batch_too_large"
         end
-
+        local work = batchWork(limits, count)
+        if work == nil then
+            return false, nil, "decoded_work_limit"
+        end
         local values = table.create(count)
-        local reader = { data = data, offset = start + 2, length = finish }
-
+        local reader = { data = data, offset = start + 2, length = finish, work = work }
         for i = 1, count do
             if reader.offset > finish - 4 then
                 return false, nil, "truncated_batch"
@@ -1518,7 +1606,9 @@ function TransportCodec.compile(spec: any): (any?, string?)
                 if reader.offset + itemCount * #fields ~= reader.length then
                     return false, nil, "invalid_batch_item"
                 end
-
+                if not charge(work, 1 + itemCount * (1 + #fields)) then
+                    return false, nil, "decoded_work_limit"
+                end
                 local value, e =
                     readFixedByteArray(data, reader.offset, itemCount, fields, byteFieldsFullRange)
                 if not value then
@@ -1594,10 +1684,12 @@ function TransportCodec.compile(spec: any): (any?, string?)
         if length > maximumPayloadBytes then
             return false, nil, "batch_too_large"
         end
-
+        local work = batchWork(limits, count)
+        if work == nil then
+            return false, nil, "decoded_work_limit"
+        end
         local values = table.create(count)
-        local reader = { data = data, offset = start + 2, length = finish }
-
+        local reader = { data = data, offset = start + 2, length = finish, work = work }
         for i = 1, count do
             local itemStart = reader.offset
 
@@ -1622,7 +1714,9 @@ function TransportCodec.compile(spec: any): (any?, string?)
                 if not need(reader, itemBytes) then
                     return false, nil, "truncated_batch"
                 end
-
+                if not charge(work, 1 + itemCount * (1 + #fields)) then
+                    return false, nil, "decoded_work_limit"
+                end
                 local item, e =
                     readFixedByteArray(data, reader.offset, itemCount, fields, byteFieldsFullRange)
                 if not item then
