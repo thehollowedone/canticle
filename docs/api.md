@@ -4,7 +4,14 @@ Require the Canticle package root. Compile schemas and routes once at startup; u
 
 ## Schemas
 
-`Codec.compile(schema)` returns `codec, nil` or `nil, reason`. A codec exposes `fingerprint`, `maximumBytes` and `maximumDecodedValues`. Schemas whose worst-case decoded traversal exceeds 65,536 values are rejected with `schema_decoded_too_large`, including nested arrays of zero-byte enums or empty records. This counts containers, primitive values and absent optional-field visits; it is a work bound, not a heap-byte estimate.
+`Codec.compile(schema)` returns `codec, nil` or `nil, reason`. A codec exposes
+`fingerprint`, `maximumBytes` and `maximumDecodedValues`.
+
+Compilation rejects schemas whose worst-case decoded traversal exceeds 65,536
+values with `schema_decoded_too_large`. This includes nested arrays of zero-byte
+enums or empty records. The count includes containers, primitive values and
+absent optional-field visits. Use it to bound traversal work; measure heap use
+separately.
 
 | Type | Fields |
 | --- | --- |
@@ -25,7 +32,15 @@ Field order, bounds, and encoding affect compatibility. Optional fields use a pr
 | `encodeBatch(values, limits?)` / `encodeCompactBatch(values, limits?)` | `buffer?, reason?` |
 | `decodeBatch(bytes, limits?)` / `decodeCompactBatch(bytes, limits?)` | `ok, values?, reason?` |
 
-Batch limits: `maximumItems`, `maximumItemBytes`, `maximumPayloadBytes`, `maximumDecodedValues`. Each ordinary or compact batch shares a hard 262,144-value allowance, including its outer slots. `maximumDecodedValues` may lower that allowance (integer 1 through 262,144); exceeding it returns `decoded_work_limit` before the next allocation or traversal. Generated client encoders (including trusted mode) and native decoders enforce the same allowance. Accepted schemas keep their existing fingerprints and wire format. Compact batches omit item-length headers and require route opt-in.
+Batch methods accept `maximumItems`, `maximumItemBytes`, `maximumPayloadBytes`
+and `maximumDecodedValues`. Each ordinary or compact batch has a hard
+262,144-value allowance, including its outer slots. Set `maximumDecodedValues`
+to an integer from 1 through 262,144 to lower that allowance. Exceeding it returns
+`decoded_work_limit` before the next allocation or traversal. Generated client
+encoders, including trusted mode, and native decoders enforce the same allowance.
+Schema fingerprints and wire encoding are unchanged by these traversal limits.
+
+Compact batches omit item-length headers and require route opt-in.
 
 ## Routes and remotes
 
@@ -76,7 +91,12 @@ local ok, reason = channel:send(4)
 -- Call close() when the owning client lifecycle ends.
 ```
 
-The adapter handles readiness, Heartbeat progress, and player departure. `server:findPeer(player)` returns an existing peer; `removePeer(player)` retires one player; `destroy()` shuts down the adapter. Manifest mismatches refuse readiness.
+The adapter handles readiness, Heartbeat progress and player departure.
+`Remote.client()` raises an error if the handshake or readiness confirmation
+fails. Use `pcall` around setup when the game needs to handle a failed connection.
+`server:findPeer(player)` returns an existing peer; `server:removePeer(player)`
+retires one player; `server:destroy()` shuts down the adapter. Both peers must
+have matching manifests before they become ready.
 
 Route lanes: `reliable`, `unreliable`, `request`, `bulk`. Relevant options:
 
@@ -94,7 +114,7 @@ Route lanes: `reliable`, `unreliable`, `request`, `bulk`. Relevant options:
 
 | Method | Behavior |
 | --- | --- |
-| `send(value, latest?)` | Returns `ok, reason?`; `latest` enables replaceable coalescing when configured. |
+| `send(value, latest?)` | Returns `ok, reason?`. On an unreliable route, `latest = true` enables replaceable coalescing through the peer's egress scheduler. |
 | `sendBatch(values, compact?)` | Returns `ok, reason?`. |
 | `on(callback, rejected?)` | Calls `callback(value, context)` on valid input; returns an unsubscribe function. |
 | `onBatch(callback)` | Calls `callback(values, context)`; returns an unsubscribe function. |
@@ -102,7 +122,17 @@ Route lanes: `reliable`, `unreliable`, `request`, `bulk`. Relevant options:
 | `respond(requestId, value)` | Returns `ok, reason?`; requires a response codec. |
 | `cancel(requestId)` | Returns `ok, reason?`. |
 
-Malformed single values reach the optional rejection callback. Route fingerprints detect codec mismatches during setup and batch sending.
+Malformed single values reach the optional rejection callback. Route fingerprints
+detect codec mismatches during setup and batch sending.
+
+Bulk sends and `latest = true` require a peer egress configuration. Pass
+`egress = {}` in the client options, server peer factory result or raw peer
+options to use the scheduler's defaults. `latest = true` is accepted only on
+unreliable routes.
+
+A request listener receives its ID in `context.requestId`. Reply through
+`channel:respond(context.requestId, value)` using the response codec bound to
+that channel.
 
 ## Raw peers and limits
 
@@ -143,7 +173,7 @@ Optional `--trust-outbound` skips outgoing primitive checks. Structural/allocati
 
 `maximumReceiveFramesPerStep` limits all frame dispatches between `peer:step()`
 calls. Separate remote callbacks do not refill it. Excess frames wait in the
-bounded FIFO; acceptance into that queue does not mean a listener has executed.
+bounded FIFO. The listener runs when the peer drains that frame from the queue.
 Call `step()` regularly when using a peer without the Remote adapter.
 
 Terminal overload removes the server peer and marks its session closed. The
@@ -175,12 +205,13 @@ default is min(16, floor(ingress packet capacity / 4)). Queued unreliable frames
 also respect `receiveQueueReliableReserve = { frames, bytes }`: defaults reserve
 min(8, ceil(queue frame capacity / 4)) slots and enough bytes for the largest
 reliable frame, capped by queue capacity. Both reserves may be set to zero.
-They divide existing capacity; they do not increase the queue or guarantee
-reliable delivery when reliable traffic itself exceeds capacity.
+The reserves divide existing capacity. Size the queue and reliable budgets for
+the expected workload; reliable traffic can still exhaust its available capacity.
 
 Admission keeps its shared-route default of 1,024 burst tokens and 512 tokens per
 second. Twenty clients sending 30 updates per second need 600 tokens per second
-on that route. A larger burst only postpones sustained drops. Measure frame
+on that route. Increase the sustained allowance to support that rate; a larger
+burst alone still runs out under sustained traffic. Measure frame
 sizes, dispatch cost, and desired update frequency before changing budgets.
 For a measured 600/s route, a bounded override such as
 `routeLimits = { [routeId] = { sharedRoutePackets = { capacity = 1024, refillPerSecond = 660 } } }`
@@ -195,10 +226,9 @@ unreliable route; `reliableReserveFraction` accepts 0..0.5.
 
 `Admission:status()` and the server adapter's `status().admission` expose accepted
 counts and fixed-reason denial counts. Valid reliable frames denied by ordinary
-admission still consume their sequence position; transport ordering is not an
-application delivery guarantee. Request timeouts, acknowledgements, or state
-reconciliation must make missing application work visible. Terminal queue or
-ingress overload closes the session instead of leaving a destroyed peer active.
+admission still consume their sequence position. Detect missing application
+work through request timeouts, acknowledgements or state reconciliation.
+Terminal queue or ingress overload closes the session and retires the peer.
 
 The server Remote adapter shares a 128-frame receive budget per step (configurable
 from 1 to 4096 with `settings.maximumReceiveFramesPerStep`) and rotates the first

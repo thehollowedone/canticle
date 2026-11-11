@@ -8,7 +8,24 @@ Buffer-based networking for Roblox Luau, with bounded codecs, queues, and reques
 
 ## Install
 
-Map `src` to a ModuleScript package with Rojo. Require its root:
+Place a reviewed checkout at `vendor/Canticle` in the game repository, then add
+this mapping to the game's Rojo project:
+
+```json
+{
+  "ReplicatedStorage": {
+    "Packages": {
+      "$className": "Folder",
+      "Canticle": {
+        "$path": "vendor/Canticle/src"
+      }
+    }
+  }
+}
+```
+
+Keep the game's existing service mappings and other packages. Require the
+resulting ModuleScript:
 
 ```lua
 local Canticle = require(game:GetService("ReplicatedStorage").Packages.Canticle)
@@ -26,16 +43,20 @@ See the [API guide](docs/api.md) for routes, live remotes, batching, and cleanup
 
 ## Development
 
-Install the tools pinned in `rokit.toml`, then:
+Install the tools pinned in `rokit.toml`. In PowerShell 7, run:
 
 ```powershell
-powershell -NoProfile -File tools/check-types.ps1
+pwsh -NoProfile -File tools/check-types.ps1
 lune run tests/run.luau
 rojo build default.project.json -o build/Canticle.rbxm
 ```
 
 `src/` contains the runtime, `tools/` the codec generators, and `tests/` the tests.
-Type analysis covers every runtime and generator module with both Luau solvers
-under default and enabled flags.
+Type analysis checks `src/`, `ClientCodecGenerator.luau` and
+`NativeCodecGenerator.luau` with both Luau solvers under default and enabled flags.
+The generator CLI entrypoints are outside that analysis.
+
+For Studio-only installation, import `build/Canticle.rbxm` and move its
+`Canticle` child to `ReplicatedStorage.Packages.Canticle`.
 
 [MIT license](LICENSE).
