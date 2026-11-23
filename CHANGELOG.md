@@ -2,24 +2,28 @@
 
 ## Unreleased
 
-- Preserve request limits and settlement during reentrant callbacks. Disconnecting an old listener leaves its replacement active, including when both registrations use the same function.
-- Reject integer schemas whose endpoints require different 32-bit representations. Reject gaps and named keys in object-field and enum declarations before they can silently drop values.
-- Reject nonzero unused bits in an object's optional-field bitmap on single and batch reads. Existing Canticle encoders already emit zero padding.
-- Reduce per-field work in generated checked byte-record encoders. Regenerate existing client modules to pick up the change.
-- Remove three temporary tables from ordinary packet receives and skip the empty receive queue. Yielding listeners retain their resume values and reliable delivery order.
-- Load the optional egress scheduler on demand when using standalone route or manifest configuration.
-- Check private event and batch permissions at delivery. Withheld bulk messages leave the next reliable sequence available. Each queued frame is checked against its own deadline.
-- Share the server’s per-step item and byte limits across peers with pending sends. Incoming frames and request deadlines continue to make progress when the send allowance runs out.
-- Enforce request-only byte limits on both peers, check encoded payload sizes before sending, and reject raw batch counts that exceed the 16-bit header.
-- Run the optional raw-peer admission callback before parsing. Deny admission when a clock fails or the gate closes during its clock read.
-- Check float32 bounds after rounding. Enum labels and field names containing reserved punctuation have updated fingerprints. Rebuild both endpoints and regenerate any specialized codecs for those schemas.
+### Upgrade notes
+
+- Schema fingerprints changed for enum labels and object field names containing any of `% , : { } | ? !`. If your schemas use these characters, rebuild both endpoints and regenerate their specialized codecs together.
+- Schema compilation now rejects a worst-case traversal above 65,536 values. Ordinary and compact batches allow up to 262,144 value visits, including outer slots. Set `maximumDecodedValues` to lower the batch limit. Regenerate existing codecs to apply it to generated encoders and decoders. [Schema limits](docs/api.md#schemas)
+
+### Transport
+
+- Private events and batches can supply `canSend` to check the recipient's permission at delivery. Withholding a queued bulk frame leaves its sequence number available for the next eligible frame. The scheduler checks each frame's age before sending it.
+- Peers share the server's per-step byte and item limits for queued sends. Receive processing and request timeouts continue when that allowance runs out.
+- Both peers enforce `maximumRequestBytes` on requests. Senders check encoded payload sizes and reject raw batch counts above 65,535 before writing the frame.
+- An optional raw-peer `attempt` callback can reject incoming frames before parsing. Admission also fails if its clock errors or the gate closes during the clock read.
+- Reentrant callbacks can no longer exceed outstanding request limits or send a request that has already settled. Disconnecting an old listener preserves its replacement, even when both use the same function.
+
+### Codecs and performance
+
+- Schema compilation rejects sparse or named entries in object-field and enum lists, and integer ranges that require both signed and unsigned 32-bit encodings.
+- Float32 values must satisfy their bounds after rounding. Single and batch decoders reject nonzero padding in optional-field bitmaps. Existing Canticle encoders already write zero padding.
+- Generated checked byte-record encoders do less work per field. Regenerate client modules to pick up the change.
+- Ordinary packet receives allocate three fewer temporary tables and skip empty receive queues. Standalone route and manifest configuration load the egress scheduler only when needed.
 
 ## 0.1.0
 
-- Retire overloaded transport sessions, bound receive work across callbacks, and reserve queued capacity for reliable traffic.
-- Add per-route admission limits and drop counters for measured traffic budgets.
-
-- Discard late responses before payload copying; prevent retired decoder completions from dispatching callbacks.
-- Standalone Roblox Luau transport with bounded schemas and queues, admission budgets, request lifetimes, readiness handshakes, and lifecycle cleanup.
-- Schema-bound channels, compact batches, and optional generated batch codecs.
-- Session ownership and epochs remain isolated across yielding setup, reconnect, removal, and shutdown callbacks.
+- Introduced schema-bound channels, compact batches and optional generated batch codecs for Roblox Luau. The transport handles readiness handshakes, request lifetimes and session cleanup.
+- Added per-route admission limits and drop counters. Receive work is bounded across callbacks, queues reserve capacity for reliable traffic, and overloaded sessions retire.
+- Isolated session epochs across yielding setup, reconnect, removal and shutdown. Late responses are discarded before copying their payloads, and a decoder that finishes after retirement cannot dispatch a callback.
