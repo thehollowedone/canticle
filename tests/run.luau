@@ -10,6 +10,7 @@ local suites = {
     require("./TransportLifecycle.spec"),
     require("./TransportRemote.spec"),
     require("./TransportEgress.spec"),
+    require("./TransportEgressAuthorization.spec"),
     require("./NativeCodecGenerator.spec"),
     require("./ClientCodecGenerator.spec"),
     require("./Channel.spec"),

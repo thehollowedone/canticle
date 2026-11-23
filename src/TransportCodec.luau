@@ -16,6 +16,7 @@ local MAX_BATCH_VALUES = 262144
 local U32 = 4294967295
 local I32_MIN = -2147483648
 local I32_MAX = 2147483647
+local float32Scratch = buffer.create(4)
 
 type Node = { [string]: any }
 type WorkBudget = { remaining: number }
@@ -146,6 +147,14 @@ local function normalizeIntegerEncoding(
     return encoding, nil
 end
 
+-- Literal labels share the signature with structural delimiters.
+local function signatureLabel(value: string): string
+    local escaped = string.gsub(value, "[%%,:{}|?!]", function(delimiter)
+        return string.format("%%%02X", string.byte(delimiter))
+    end)
+    return escaped
+end
+
 local function compile(rawSpec: any, depth: number): (Node?, string?)
     if depth > MAX_DEPTH or type(rawSpec) ~= "table" then
         return nil, "invalid_schema"
@@ -261,6 +270,7 @@ local function compile(rawSpec: any, depth: number): (Node?, string?)
 
         local byValue = {}
         local copy = {}
+        local labels = {}
 
         for i, value in ipairs(values) do
             if type(value) ~= "string" or byValue[value] then
@@ -268,6 +278,7 @@ local function compile(rawSpec: any, depth: number): (Node?, string?)
             end
             byValue[value] = i - 1
             copy[i] = value
+            labels[i] = signatureLabel(value)
         end
 
         local bytes = if #copy <= 1 then 0 else 1
@@ -277,7 +288,7 @@ local function compile(rawSpec: any, depth: number): (Node?, string?)
             byValue = byValue,
             maximumValues = 1,
             maximumBytes = bytes,
-            signature = kind .. ":" .. table.concat(copy, "|"),
+            signature = kind .. ":" .. table.concat(labels, "|"),
         },
             nil
     elseif kind == "array" then
@@ -385,7 +396,9 @@ local function compile(rawSpec: any, depth: number): (Node?, string?)
                 return nil, "schema_decoded_too_large"
             end
             maximumBytes += node.maximumBytes
-            signatures[index] = field.name .. (if optional then "?" else "!") .. node.signature
+            signatures[index] = signatureLabel(field.name)
+                .. (if optional then "?" else "!")
+                .. node.signature
         end
 
         local bitmapBytes = math.ceil(optionalCount / 8)
@@ -442,6 +455,13 @@ local function sizeOf(node: Node, value: any, work: WorkBudget): (number?, strin
     elseif kind == "number" then
         if not finite(value) or value < node.minimum or value > node.maximum then
             return nil, "invalid_number"
+        end
+        if node.encoding == "f32" then
+            buffer.writef32(float32Scratch, 0, value)
+            local rounded = buffer.readf32(float32Scratch, 0)
+            if not finite(rounded) or rounded < node.minimum or rounded > node.maximum then
+                return nil, "invalid_number"
+            end
         end
 
         return node.maximumBytes, nil

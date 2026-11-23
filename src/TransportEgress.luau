@@ -1,6 +1,16 @@
 --!strict
 
+local Callbacks = if script
+    then require(script.Parent.TransportCallbacks)
+    else require("./TransportCallbacks")
+
 local Egress = {}
+type StepBudget = {
+    maximumBytes: number,
+    bytesRemaining: number,
+    itemsRemaining: number,
+    blocked: boolean,
+}
 type Entry = {
     key: any,
     frame: buffer,
@@ -8,6 +18,7 @@ type Entry = {
     enqueuedAt: number,
     emit: (buffer) -> (),
     reliable: boolean,
+    canSend: (() -> boolean)?,
 }
 
 local function finite(value: any): boolean
@@ -54,7 +65,13 @@ function Egress.validate(options: any): (any?, string?)
         nil
 end
 
-function Egress.new(options: any, clock: () -> number, onEvent: any, onFailure: any): any
+function Egress.new(
+    options: any,
+    clock: () -> number,
+    onEvent: any,
+    onFailure: any,
+    budget: StepBudget?
+): any
     local limits, err = Egress.validate(options)
     assert(limits, err)
     local queues: { [string]: { [number]: Entry? } } = { latest = {}, bulk = {} }
@@ -70,7 +87,7 @@ function Egress.new(options: any, clock: () -> number, onEvent: any, onFailure: 
 
     local function event(name: string, size: number?)
         if type(onEvent) == "function" then
-            pcall(onEvent, name, size)
+            Callbacks.synchronous(onEvent, name, size)
         end
     end
 
@@ -79,7 +96,8 @@ function Egress.new(options: any, clock: () -> number, onEvent: any, onFailure: 
         key: any,
         frame: buffer,
         emit: (buffer) -> (),
-        reliable: boolean
+        reliable: boolean,
+        canSend: (() -> boolean)?
     ): (boolean, string?)
         if closed then
             return false, "egress_closed"
@@ -89,10 +107,17 @@ function Egress.new(options: any, clock: () -> number, onEvent: any, onFailure: 
             return false, "invalid_egress_kind"
         end
 
-        local ok, now = pcall(clock)
+        if canSend ~= nil and type(canSend) ~= "function" then
+            return false, "invalid_send_guard"
+        end
+
+        local ok, now = Callbacks.synchronous(clock)
 
         if not ok or not finite(now) then
             return false, "clock_failed"
+        end
+        if closed then
+            return false, "egress_closed"
         end
 
         local size = buffer.len(frame)
@@ -102,6 +127,7 @@ function Egress.new(options: any, clock: () -> number, onEvent: any, onFailure: 
 
         if
             size > limits.maximumBytesPerStep
+            or (budget ~= nil and size > budget.maximumBytes)
             or prospectiveCount > limits.maximumItems
             or prospectiveBytes > limits.maximumBytes
         then
@@ -114,18 +140,21 @@ function Egress.new(options: any, clock: () -> number, onEvent: any, onFailure: 
             replaced.size = size
             replaced.enqueuedAt = now
             replaced.emit = emit
+            replaced.reliable = reliable
+            replaced.canSend = canSend
             bytes = prospectiveBytes
             event("coalesced", size)
             return true, "queued"
         end
 
-        local entry = {
+        local entry: Entry = {
             key = key,
             frame = frame,
             size = size,
             enqueuedAt = now,
             emit = emit,
             reliable = reliable,
+            canSend = canSend,
         }
         tails[kind] += 1
         queues[kind][tails[kind]] = entry
@@ -138,14 +167,9 @@ function Egress.new(options: any, clock: () -> number, onEvent: any, onFailure: 
         return true, "queued"
     end
 
-    local function take(kind: string): any
+    local function take(kind: string, entry: Entry)
         local queue = queues[kind]
         local head = heads[kind]
-        local entry = queue[head]
-
-        if not entry then
-            return nil
-        end
         queue[head] = nil
         heads[kind] = head + 1
         if kind == "latest" and latestByKey[entry.key] == entry then
@@ -153,10 +177,6 @@ function Egress.new(options: any, clock: () -> number, onEvent: any, onFailure: 
         end
         count -= 1
         bytes -= entry.size
-        return entry
-    end
-
-    local function compactIfEmpty(kind: string)
         if heads[kind] > tails[kind] then
             table.clear(queues[kind])
             heads[kind] = 1
@@ -164,57 +184,92 @@ function Egress.new(options: any, clock: () -> number, onEvent: any, onFailure: 
         end
     end
 
-    function scheduler:step(): number
+    function scheduler:hasPending(): boolean
+        return count > 0
+    end
+
+    function scheduler:step(quantum: number?): number
         if closed or stepping then
             return 0
         end
 
-        local ok, now = pcall(clock)
-
-        if not ok or not finite(now) then
-            return 0
-        end
         stepping = true
         local emitted = 0
         local emittedBytes = 0
         local processed = 0
 
-        while processed < limits.maximumItemsPerStep do
+        local maximum = math.min(quantum or limits.maximumItemsPerStep, limits.maximumItemsPerStep)
+        while not closed and count > 0 and processed < maximum do
+            local ok, now = Callbacks.synchronous(clock)
+            if not ok or not finite(now) or closed then
+                break
+            end
             local hasLatest = queues.latest[heads.latest] ~= nil
             local hasBulk = queues.bulk[heads.bulk] ~= nil
             local kind = if hasLatest
                     and (not hasBulk or latestSinceBulk < limits.maximumLatestBurst)
                 then "latest"
                 else "bulk"
-            local entry = take(kind)
+            local entry = queues[kind][heads[kind]]
 
             if not entry then
                 break
             end
-            processed += 1
             if emitted > 0 and emittedBytes + entry.size > limits.maximumBytesPerStep then
-                -- Requeue without resetting its age.
-                heads[kind] -= 1
-                queues[kind][heads[kind]] = entry
-                if kind == "latest" then
-                    latestByKey[entry.key] = entry
-                end
-                count += 1
-                bytes += entry.size
                 break
             end
+            local shared = budget
+            if shared then
+                if shared.itemsRemaining <= 0 or entry.size > shared.bytesRemaining then
+                    shared.blocked = true
+                    break
+                end
+                shared.itemsRemaining -= 1
+                shared.bytesRemaining -= entry.size
+            end
 
+            take(kind, entry)
+            processed += 1
             if kind == "latest" then
                 latestSinceBulk += 1
             else
                 latestSinceBulk = 0
             end
 
-            if now - entry.enqueuedAt > limits.maximumAgeSeconds then
+            local expired = now - entry.enqueuedAt > limits.maximumAgeSeconds
+            if not expired and entry.canSend then
+                local called, allowed = Callbacks.synchronous(entry.canSend)
+                if closed then
+                    break
+                end
+                if not called or allowed ~= true then
+                    event("withheld", entry.size)
+                    continue
+                end
+                -- Authorization may run application code. Recheck age at the handoff.
+                ok, now = Callbacks.synchronous(clock)
+                if closed then
+                    break
+                end
+                if not ok or not finite(now) then
+                    event("failed", entry.size)
+                    if entry.reliable then
+                        Callbacks.synchronous(onFailure, "clock_failed")
+                        break
+                    end
+                    continue
+                end
+                expired = now - entry.enqueuedAt > limits.maximumAgeSeconds
+                if kind == "latest" and latestByKey[entry.key] ~= nil then
+                    -- A newer value arrived for this key while its guard ran.
+                    event("coalesced", entry.size)
+                    continue
+                end
+            end
+            if expired then
                 event("expired", entry.size)
-                compactIfEmpty(kind)
                 if entry.reliable then
-                    pcall(onFailure, "egress_expired")
+                    Callbacks.synchronous(onFailure, "egress_expired")
                     break
                 end
             else
@@ -222,13 +277,12 @@ function Egress.new(options: any, clock: () -> number, onEvent: any, onFailure: 
 
                 if not sent then
                     event("failed", entry.size)
-                    pcall(onFailure, "transport_failed")
+                    Callbacks.synchronous(onFailure, "transport_failed")
                     break
                 end
                 emitted += 1
                 emittedBytes += entry.size
                 event("emitted", entry.size)
-                compactIfEmpty(kind)
             end
         end
         stepping = false

@@ -191,6 +191,12 @@ function Config.routes(raw: any): ({ any }?, string?)
             return nil, "invalid_route_request_limit"
         end
 
+        local requestBytes = if route.maximumRequestBytes == nil
+            then payload
+            else route.maximumRequestBytes
+        if laneIs(route.lane, "request") and not integer(requestBytes, 0, payload) then
+            return nil, "invalid_route_request_bytes"
+        end
         local copy = table.clone(route)
         copy.maximumFrameBytes = frame
         copy.maximumPayloadBytes = payload
@@ -198,6 +204,7 @@ function Config.routes(raw: any): ({ any }?, string?)
         copy.maximumBatchItems = if allowBatch then maximumBatchItems else 0
         copy.maximumBatchItemBytes = if allowBatch then maximumBatchItemBytes else 0
         copy.maximumOutstandingRequests = routeRequests
+        copy.maximumRequestBytes = if laneIs(route.lane, "request") then requestBytes else 0
         copy.allowBatch = allowBatch
         copy.allowCompactBatch = allowCompactBatch
         copy.allowOutboundCompression = route.allowOutboundCompression == true

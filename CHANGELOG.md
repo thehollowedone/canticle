@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Check private event and batch permissions at delivery. Withheld bulk messages leave the next reliable sequence available. Each queued frame is checked against its own deadline.
+- Share the server’s per-step item and byte limits across peers with pending sends. Incoming frames and request deadlines continue to make progress when the send allowance runs out.
+- Enforce request-only byte limits on both peers, check encoded payload sizes before sending, and reject raw batch counts that exceed the 16-bit header.
+- Run the optional raw-peer admission callback before parsing. Deny admission when a clock fails or the gate closes during its clock read.
+- Check float32 bounds after rounding. Enum labels and field names containing reserved punctuation have updated fingerprints. Rebuild both endpoints and regenerate any specialized codecs for those schemas.
+
 ## 0.1.0
 
 - Retire overloaded transport sessions, bound receive work across callbacks, and reserve queued capacity for reliable traffic.

@@ -3,6 +3,7 @@ return function()
     local Config = require("../src/TransportConfig")
     local Frame = require("../src/TransportFrame")
     local Peer = require("../src/TransportPeer")
+    local Manifest = require("../src/TransportManifest")
     local routes = {
         {
             id = 1,
@@ -13,6 +14,74 @@ return function()
         },
         { id = 2, lane = "unreliable", maximumFrameBytes = 128, maximumPayloadBytes = 64 },
     }
+    do
+        local sent, handled = 0, 0
+        local peer = Peer.new({
+            epoch = 1,
+            routes = routes,
+            sendReliable = function()
+                sent += 1
+            end,
+        })
+        peer:on(1, function()
+            handled += 1
+        end)
+        local id, reason = peer:request(1, buffer.create(9), 1, function() end)
+        assert(
+            id == nil and reason == "request_too_large" and sent == 0,
+            "oversized request reached the transport"
+        )
+        assert(
+            peer:status().outstandingRequests == 0,
+            "rejected request retained an outstanding slot"
+        )
+        assert(peer:request(1, buffer.create(8), 1, function() end))
+        assert(
+            peer:respond(1, 1, buffer.create(9)) and sent == 2,
+            "responses can exceed the request-only cap"
+        )
+        for sequence, size in { 9, 8 } do
+            local request = assert(Frame.encode({
+                epoch = 1,
+                route = 1,
+                sequence = sequence,
+                requestId = sequence,
+                lane = "request",
+                payload = buffer.create(size),
+            }))
+            local accepted, why = peer:receive(request, "reliable")
+            if size == 9 then
+                assert(
+                    not accepted and why == "route_bounds" and handled == 0,
+                    "receiver dispatched an oversized request"
+                )
+            else
+                assert(
+                    accepted and handled == 1,
+                    "the next in-order request at the limit must dispatch"
+                )
+            end
+        end
+        peer:destroy()
+        local route = table.clone(routes[1])
+        local tight = assert(Manifest.build({ route }))
+        route.maximumRequestBytes = nil
+        local default = assert(Manifest.build({ route }))
+        assert(
+            tight.fingerprint ~= default.fingerprint,
+            "peers with different request budgets must detect the mismatch"
+        )
+        route.maximumRequestBytes = route.maximumPayloadBytes
+        assert(
+            default.fingerprint == assert(Manifest.build({ route })).fingerprint,
+            "stating the default must preserve compatibility"
+        )
+        route.maximumRequestBytes = route.maximumPayloadBytes + 1
+        assert(
+            not Manifest.build({ route }),
+            "a request cap above the payload limit must be rejected"
+        )
+    end
     local function frame(sequence, lane, route)
         return assert(Frame.encode({
             epoch = 1,

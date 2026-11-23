@@ -345,6 +345,20 @@ function Remote.server(
     local maximumReceiveFramesPerStep = settings.maximumReceiveFramesPerStep or 128
     assert(integer(maximumReceiveFramesPerStep, 1, 4096), "invalid server receive work budget")
     local receiveRemaining = maximumReceiveFramesPerStep
+    local maximumEgressItemsPerStep = settings.maximumEgressItemsPerStep or 256
+    local maximumEgressBytesPerStep = settings.maximumEgressBytesPerStep or 4 * 1024 * 1024
+    assert(integer(maximumEgressItemsPerStep, 1, 65536), "invalid server egress item budget")
+    assert(
+        integer(maximumEgressBytesPerStep, 1, 64 * 1024 * 1024),
+        "invalid server egress byte budget"
+    )
+    local egressBudget = {
+        maximumBytes = maximumEgressBytesPerStep,
+        bytesRemaining = maximumEgressBytesPerStep,
+        itemsRemaining = maximumEgressItemsPerStep,
+        blocked = false,
+    }
+    local nextEgressPlayer: Player? = nil
     local peerOrder: { Player } = {}
     local nextPeer = 1
     local stepOwner: thread? = nil
@@ -352,9 +366,15 @@ function Remote.server(
     local handle = {}
 
     local function allowWindow(windows: any, player: Player, maximum: number): boolean
-        local ok, now = pcall(clock)
+        local ok, now = Callbacks.synchronous(clock)
 
-        if not ok or type(now) ~= "number" or now ~= now then
+        if
+            not ok
+            or state ~= "OPEN"
+            or type(now) ~= "number"
+            or now ~= now
+            or math.abs(now) == math.huge
+        then
             return false
         end
 
@@ -373,6 +393,9 @@ function Remote.server(
     end
 
     local function remove(player: Player, _reason: string?)
+        if nextEgressPlayer == player then
+            nextEgressPlayer = nil
+        end
         creations[player] = nil
         local peer = peers[player]
         peers[player] = nil
@@ -537,6 +560,7 @@ function Remote.server(
             end
         end
 
+        config.serverEgressBudget = egressBudget
         local made, peer = pcall(Peer.new, config)
 
         if not made or state ~= "OPEN" or creations[player] ~= token then
@@ -616,6 +640,8 @@ function Remote.server(
         local generation = stepGeneration
         stepOwner = coroutine.running()
         receiveRemaining = maximumReceiveFramesPerStep
+        egressBudget.itemsRemaining = maximumEgressItemsPerStep
+        egressBudget.bytesRemaining = maximumEgressBytesPerStep
         local expired = 0
 
         for player, session in sessions do
@@ -629,6 +655,8 @@ function Remote.server(
         local count = #order
         local first = if count > 0 then ((nextPeer - 1) % count) + 1 else 1
         nextPeer = first + 1
+        local ready: { Player } = {}
+        local firstReady = 1
         for offset = 0, count - 1 do
             if generation ~= stepGeneration or state ~= "OPEN" then
                 return expired
@@ -638,8 +666,53 @@ function Remote.server(
             local peer = peers[player]
 
             if peer then
-                expired += peer:step()
+                expired += peer:_step(false)
+                if peers[player] == peer and peer.egress and peer.egress:hasPending() then
+                    table.insert(ready, player)
+                    if player == nextEgressPlayer then
+                        firstReady = #ready
+                    end
+                end
             end
+        end
+
+        -- Ingress and timeouts ran for every peer. Divide queued sends among
+        -- backlogged peers and resume at the first one the shared cap deferred.
+        if generation ~= stepGeneration or state ~= "OPEN" then
+            return expired
+        end
+        nextEgressPlayer = nil
+        for offset = 0, #ready - 1 do
+            if generation ~= stepGeneration or state ~= "OPEN" then
+                return expired
+            end
+            local index = (firstReady + offset - 1) % #ready + 1
+            local player = ready[index]
+            local peer = peers[player]
+            if not peer or not peer.egress or not peer.egress:hasPending() then
+                continue
+            end
+            if egressBudget.itemsRemaining == 0 or egressBudget.bytesRemaining == 0 then
+                nextEgressPlayer = player
+                break
+            end
+            local before = egressBudget.itemsRemaining
+            local quantum = math.max(1, math.floor(before / (#ready - offset)))
+            egressBudget.blocked = false
+            peer.egress:step(quantum)
+            if generation ~= stepGeneration or state ~= "OPEN" then
+                return expired
+            end
+            if egressBudget.blocked then
+                nextEgressPlayer = if before == egressBudget.itemsRemaining
+                    then player
+                    else ready[index % #ready + 1]
+                break
+            end
+            nextEgressPlayer = ready[firstReady % #ready + 1]
+        end
+        if nextEgressPlayer and not peers[nextEgressPlayer] then
+            nextEgressPlayer = nil
         end
 
         if generation == stepGeneration then
@@ -656,6 +729,10 @@ function Remote.server(
             admission = admission:status(),
             receiveRemaining = receiveRemaining,
             maximumReceiveFramesPerStep = maximumReceiveFramesPerStep,
+            egressItemsRemaining = egressBudget.itemsRemaining,
+            egressBytesRemaining = egressBudget.bytesRemaining,
+            maximumEgressItemsPerStep = maximumEgressItemsPerStep,
+            maximumEgressBytesPerStep = maximumEgressBytesPerStep,
         }
     end
 

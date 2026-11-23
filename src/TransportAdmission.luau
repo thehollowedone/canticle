@@ -1,5 +1,8 @@
 --!strict
 
+local Callbacks = if script
+    then require(script.Parent.TransportCallbacks)
+    else require("./TransportCallbacks")
 local Admission = {}
 type Bucket = { capacity: number, refill: number, tokens: number, last: number }
 type RouteBucket = { raw: Bucket, expanded: Bucket }
@@ -51,10 +54,9 @@ end
 function Admission.new(options: any): any
     assert(type(options) == "table", "options required")
     local clock = options.clock or os.clock
-    local function now(): number
-        local ok, value = pcall(clock)
-        assert(ok and finite(value), "clock failed")
-        return value
+    local function now(): number?
+        local ok, value = Callbacks.synchronous(clock)
+        return if ok and finite(value) then value else nil
     end
 
     local packet = readSpec(options, "packets", nil, 256, 128)
@@ -134,7 +136,7 @@ function Admission.new(options: any): any
         return false, reason
     end
 
-    local started = now()
+    local started = assert(now(), "clock failed")
     local gate = {
         clock = now,
         specs = {
@@ -155,14 +157,13 @@ function Admission.new(options: any): any
         closed = false,
     }
 
-    function gate:_peer(id: any)
+    function gate:_peer(id: any, current: number)
         local peer: PeerBucket? = self.peers[id]
 
         if peer then
             return peer
         end
 
-        local current = self.clock()
         local created: PeerBucket = {
             packets = makeBucket(packet.capacity, packet.refill, current),
             raw = makeBucket(peerRaw.capacity, peerRaw.refill, current),
@@ -217,15 +218,21 @@ function Admission.new(options: any): any
     ): (boolean, string?)
         if
             self.closed
+            or peerId == nil
+            or peerId ~= peerId
             or not finiteInteger(rawBytes, 0)
             or not finiteInteger(expandedBytes, 0)
             or not finiteInteger(route, 1)
+            or route > 65535
         then
             return deny("invalid_admission")
         end
 
         local current = self.clock()
-        local peer = self:_peer(peerId)
+        if current == nil or self.closed then
+            return deny("invalid_admission")
+        end
+        local peer = self:_peer(peerId, current)
         local peerRoute = self:_route(peer, route, current)
         local sharedRoute = self:_shared(route, current)
 

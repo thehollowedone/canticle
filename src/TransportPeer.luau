@@ -30,6 +30,7 @@ type Route = {
     maximumBatchItems: number,
     maximumBatchItemBytes: number,
     maximumOutstandingRequests: number,
+    maximumRequestBytes: number,
     allowBatch: boolean,
     allowCompactBatch: boolean,
     allowOutboundCompression: boolean,
@@ -46,6 +47,8 @@ type PeerData = {
     sendReliable: (buffer) -> (),
     sendUnreliable: ((buffer) -> ())?,
     admit: any,
+    attempt: ((number, string) -> (boolean, string?))?,
+    attempting: boolean,
     compressor: any,
     compressionPolicy: any,
     metrics: any,
@@ -103,6 +106,11 @@ local function finite(value: any): boolean
     return type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge
 end
 
+local function nextSequence(self: PeerState, routeId: number): number
+    local current = self.sentRoutes[routeId] or 0
+    return if current >= U32 then 1 else current + 1
+end
+
 local function laneIs(lane: any, expected: string): boolean
     return lane == expected
 end
@@ -124,6 +132,7 @@ function Peer.new(options: any): PeerState
     local config, err = Config.peer(options)
     assert(config, err)
     assert(type(config.sendReliable) == "function", "reliable sender required")
+    assert(config.attempt == nil or type(config.attempt) == "function", "invalid attempt gate")
     local routes: { [number]: Route } = {}
     local maximumInboundFrameBytes = 0
 
@@ -139,6 +148,8 @@ function Peer.new(options: any): PeerState
         sendReliable = config.sendReliable,
         sendUnreliable = config.sendUnreliable,
         admit = config.admit,
+        attempt = config.attempt,
+        attempting = false,
         compressor = config.compressor,
         compressionPolicy = config.compressionPolicy,
         permitOutboundCompression = config.permitOutboundCompression == true,
@@ -193,7 +204,7 @@ function Peer.new(options: any): PeerState
             metric(value, "egress", event, bytes)
         end, function(reason: string)
             value:_terminate(reason)
-        end)
+        end, config.serverEgressBudget)
     end
 
     return value
@@ -465,14 +476,21 @@ function Impl._sendNow(
     requestId: number?,
     batch: boolean?,
     latest: boolean?,
-    compactBatch: boolean?
+    compactBatch: boolean?,
+    canSend: (() -> boolean)?
 ): (boolean, string?)
     if self.destroyed or not isBuffer(payload) then
         return false, if self.destroyed then "destroyed" else "payload_must_be_buffer"
     end
+    if canSend ~= nil and type(canSend) ~= "function" then
+        return false, "invalid_send_guard"
+    end
 
     if buffer.len(payload) > route.maximumExpandedBytes then
         return false, "payload_too_large"
+    end
+    if lane == "request" and buffer.len(payload) > route.maximumRequestBytes then
+        return false, "request_too_large"
     end
 
     local outbound = payload
@@ -507,9 +525,12 @@ function Impl._sendNow(
         end
     end
 
+    if buffer.len(outbound) > route.maximumPayloadBytes then
+        return false, "payload_too_large"
+    end
+
     local unreliable = lane == "unreliable"
-    local current = self.sentRoutes[route.id] or 0
-    local sequence = if current >= U32 then 1 else current + 1
+    local sequence = if lane == "bulk" then 1 else nextSequence(self, route.id)
     local frame, err = Frame.encode({
         lane = lane,
         route = route.id,
@@ -544,17 +565,44 @@ function Impl._sendNow(
             return false, "egress_scheduler_required"
         end
 
+        local emit = sender
+        if lane == "bulk" then
+            -- A withheld reliable message must never consume a wire sequence.
+            local routeId = route.id
+            local reliableSender = self.sendReliable
+            emit = function(queuedFrame: buffer)
+                local nextSent = nextSequence(self, routeId)
+                Frame.writeSequence(queuedFrame, nextSent)
+                self.sentRoutes[routeId] = nextSent
+                self.sentR = nextSent
+                reliableSender(queuedFrame)
+            end
+        end
         local accepted, scheduleReason = self.egress:submit(
             if latest == true then "latest" else "bulk",
             route.id,
             frame,
-            sender,
-            not unreliable
+            emit,
+            not unreliable,
+            canSend
         )
         if not accepted then
             return false, scheduleReason
         end
+        if lane == "bulk" then
+            return true, "queued"
+        end
     else
+        if canSend then
+            local called, allowed = Callbacks.synchronous(canSend)
+            if not called or allowed ~= true then
+                metric(self, "egress", "withheld", buffer.len(frame))
+                return false, "send_withheld"
+            end
+        end
+        if self.destroyed then
+            return false, "destroyed"
+        end
         local ok = safe(sender, frame)
 
         if not ok then
@@ -580,14 +628,25 @@ function Impl._send(
     requestId: number?,
     batch: boolean?,
     latest: boolean?,
-    compactBatch: boolean?
+    compactBatch: boolean?,
+    canSend: (() -> boolean)?
 ): (boolean, string?)
     if self.sending then
         return false, "send_in_progress"
     end
     self.sending = true
-    local called, sent, reason =
-        safe(self._sendNow, self, route, lane, payload, requestId, batch, latest, compactBatch)
+    local called, sent, reason = safe(
+        self._sendNow,
+        self,
+        route,
+        lane,
+        payload,
+        requestId,
+        batch,
+        latest,
+        compactBatch,
+        canSend
+    )
     self.sending = false
     if not called then
         self:_terminate("transport_failed")
@@ -601,7 +660,8 @@ function Impl.send(
     self: PeerState,
     routeId: number,
     payload: buffer,
-    latest: boolean?
+    latest: boolean?,
+    canSend: (() -> boolean)?
 ): (boolean, string?)
     local route = self.routes[routeId]
 
@@ -613,10 +673,15 @@ function Impl.send(
         return false, "latest_requires_unreliable"
     end
 
-    return self:_send(route, route.lane, payload, nil, false, latest)
+    return self:_send(route, route.lane, payload, nil, false, latest, nil, canSend)
 end
 
-function Impl.sendBatch(self: PeerState, routeId: number, items: any): (boolean, string?)
+function Impl.sendBatch(
+    self: PeerState,
+    routeId: number,
+    items: any,
+    canSend: (() -> boolean)?
+): (boolean, string?)
     local route = self.routes[routeId]
 
     if
@@ -636,14 +701,15 @@ function Impl.sendBatch(self: PeerState, routeId: number, items: any): (boolean,
         return false, err
     end
     metric(self, "batch", #items)
-    return self:_send(route, route.lane, payload, nil, true, false)
+    return self:_send(route, route.lane, payload, nil, true, false, nil, canSend)
 end
 
 function Impl.sendBatchValues(
     self: PeerState,
     routeId: number,
     codec: any,
-    values: any
+    values: any,
+    canSend: (() -> boolean)?
 ): (boolean, string?)
     local route = self.routes[routeId]
 
@@ -674,14 +740,15 @@ function Impl.sendBatchValues(
         return false, err
     end
     metric(self, "batch", #values)
-    return self:_send(route, route.lane, payload, nil, true, false)
+    return self:_send(route, route.lane, payload, nil, true, false, nil, canSend)
 end
 
 function Impl.sendCompactBatchValues(
     self: PeerState,
     routeId: number,
     codec: any,
-    values: any
+    values: any,
+    canSend: (() -> boolean)?
 ): (boolean, string?)
     local route = self.routes[routeId]
 
@@ -713,7 +780,7 @@ function Impl.sendCompactBatchValues(
         return false, err
     end
     metric(self, "batch", #values)
-    return self:_send(route, route.lane, payload, nil, true, false, true)
+    return self:_send(route, route.lane, payload, nil, true, false, true, canSend)
 end
 
 function Impl._nextRequest(self: PeerState): number?
@@ -923,6 +990,7 @@ function Impl._receiveNow(self: PeerState, frame: buffer, carrier: string?): (bo
         raw > route.maximumFrameBytes
         or meta.payloadLength > route.maximumPayloadBytes
         or meta.expandedSize > route.maximumExpandedBytes
+        or (meta.lane == "request" and meta.payloadLength > route.maximumRequestBytes)
     then
         return false, "route_bounds"
     end
@@ -1076,7 +1144,7 @@ function Impl._receiveNow(self: PeerState, frame: buffer, carrier: string?): (bo
     return false, "listener_failed"
 end
 
-function Impl._admitAttempt(self: PeerState, carrier: string?): (boolean, string?)
+function Impl._admitAttempt(self: PeerState, carrier: string?, frame: any): (boolean, string?)
     local ok, now = safe(self.clock)
 
     if not ok or not finite(now) then
@@ -1095,6 +1163,26 @@ function Impl._admitAttempt(self: PeerState, carrier: string?): (boolean, string
         return false, "ingress_packets"
     end
     self.ingressPacketTokens -= 1
+    local attempt = self.attempt
+    if attempt then
+        if self.attempting then
+            return false, "attempt_admission_failed"
+        end
+        self.attempting = true
+        local raw = if isBuffer(frame) then buffer.len(frame) else 0
+        local lane = if carrier == "unreliable" then "unreliable" else "reliable"
+        local called, allowed, reason = Callbacks.synchronous(attempt, raw, lane)
+        self.attempting = false
+        if self.destroyed then
+            return false, "destroyed"
+        end
+        if not called or type(allowed) ~= "boolean" then
+            return false, "attempt_admission_failed"
+        end
+        if not allowed then
+            return false, if type(reason) == "string" then reason else "limited"
+        end
+    end
     return true, nil
 end
 
@@ -1103,7 +1191,7 @@ function Impl.receive(self: PeerState, frame: any, carrier: string?): (boolean, 
         return false, "destroyed"
     end
 
-    local attempted, attemptReason = self:_admitAttempt(carrier)
+    local attempted, attemptReason = self:_admitAttempt(carrier, frame)
 
     if not attempted then
         if carrier ~= "unreliable" then
@@ -1188,7 +1276,7 @@ function Impl.receive(self: PeerState, frame: any, carrier: string?): (boolean, 
     end)
 end
 
-function Impl.step(self: PeerState): number
+function Impl._step(self: PeerState, drainEgress: boolean): number
     local operation = self.receiveOperation
 
     if operation and coroutine.status(operation.waiter) == "dead" then
@@ -1203,7 +1291,7 @@ function Impl.step(self: PeerState): number
         self.receiveRemaining = self.maximumReceiveFramesPerStep
     end
 
-    if self.egress then
+    if self.egress and drainEgress then
         self.egress:step()
     end
 
@@ -1240,6 +1328,10 @@ function Impl.step(self: PeerState): number
     end
 
     return #expired
+end
+
+function Impl.step(self: PeerState): number
+    return self:_step(true)
 end
 
 function Impl.destroy(self: PeerState)

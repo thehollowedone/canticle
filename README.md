@@ -4,7 +4,7 @@ Buffer-based networking for Roblox Luau, with bounded codecs, queues, and reques
 
 - Reliable, unreliable, request/response, cancellation, and bulk routes.
 - Schema-bound channels, standard/compact batches, and optional generated codecs.
-- Shared admission budgets, compatibility handshakes, and explicit cleanup.
+- Shared receive and send budgets, compatibility handshakes, and explicit cleanup.
 
 ## Install
 
@@ -39,7 +39,7 @@ local bytes = assert(codec:encode(4))
 local ok, value = codec:decode(bytes)
 ```
 
-See the [API guide](docs/api.md) for routes, live remotes, batching, and cleanup.
+For private queued data, pass a server-side `canSend` callback that checks the viewer’s current access just before delivery. Withholding a bulk message leaves later messages in order. See the [channel API and example](docs/api.md#channels).
 
 ## Development
 

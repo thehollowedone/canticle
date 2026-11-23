@@ -107,6 +107,46 @@ return function()
     assert(bounded:status().items == 0, "bounded expiry cleanup must make progress")
     bounded:close()
 
+    -- An earlier carrier can consume the time remaining for a later entry in this same step.
+    for _, secondLane in { "unreliable", "bulk" } do
+        now = 0
+        local wire = {}
+        local function emit(frame)
+            table.insert(wire, assert(Transport.Frame.inspect(frame)).route)
+            now = 2
+        end
+        local slow = Transport.Peer.new({
+            epoch = 3,
+            routes = { { id = 1, lane = "unreliable" }, { id = 2, lane = secondLane } },
+            clock = function()
+                return now
+            end,
+            egress = { maximumAgeSeconds = 1 },
+            sendUnreliable = emit,
+            sendReliable = emit,
+        })
+        assert(slow:send(1, bytes("fresh"), true))
+        assert(slow:send(2, bytes("too late"), secondLane == "unreliable"))
+        slow:step()
+        assert(#wire == 1 and wire[1] == 1, "frame that expired during drain reached the carrier")
+        assert(slow:status().egressItems == 0, "The expired frame must release its queue slot")
+        if secondLane == "bulk" then
+            assert(
+                slow:status().terminalReason == "egress_expired",
+                "Reliable bulk expiry must retire the peer with the expiry reason"
+            )
+        else
+            assert(
+                not slow:status().destroyed,
+                "Dropping an expired latest update must leave the peer active"
+            )
+            assert(slow:send(2, bytes("fresh again"), true))
+            slow:step()
+            assert(#wire == 2 and wire[2] == 2, "fresh latest traffic must resume")
+        end
+        slow:destroy()
+    end
+
     local expiring = Transport.Peer.new({
         epoch = 3,
         routes = routes,

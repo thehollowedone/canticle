@@ -1,7 +1,55 @@
 local Admission = require("../src/TransportAdmission")
+local AttemptAdmission = require("../src/TransportAttemptAdmission")
 local Metrics = require("../src/TransportMetrics")
 
 return function()
+    for _, module in { Admission, AttemptAdmission } do
+        local gate, clockAction
+        local samples = 0
+        gate = module.new({
+            clock = function()
+                samples += 1
+                if clockAction then
+                    return clockAction()
+                end
+                return 0
+            end,
+        })
+        local function admit(peer)
+            if module == Admission then
+                return gate:admit(peer, 1, 1, 1)
+            end
+            return gate:admit(peer, 1)
+        end
+        assert(admit("first") and samples == 2, "first admission must read the clock once")
+        assert(not admit(nil) and not admit(0 / 0), "invalid peer keys must be denied")
+        if module == Admission then
+            assert(not gate:admit("first", 65536, 1, 1), "route ID must fit the wire field")
+        else
+            assert(not gate:admit("first", 0.5), "attempt size must be a whole number of bytes")
+        end
+        clockAction = function()
+            error("clock unavailable")
+        end
+        assert(not admit("second"), "clock failure must return a denial")
+        local worker
+        clockAction = function()
+            worker = coroutine.running()
+            coroutine.yield()
+            return 0
+        end
+        assert(
+            not admit("second") and coroutine.status(worker) == "dead",
+            "yielded clock must be cancelled and admission denied"
+        )
+        clockAction = nil
+        assert(admit("second"), "a healthy clock must restore admission")
+        clockAction = function()
+            gate:close()
+            return 0
+        end
+        assert(not admit("third"), "shutdown during the clock read must fence admission")
+    end
     local function gate(overrides)
         local options = {
             clock = function()

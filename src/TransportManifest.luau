@@ -76,6 +76,10 @@ function Manifest.build(routes: any): (any?, string?)
             compression[3],
             compression[4],
         }, ":")
+        -- A tighter request limit changes the contract. Default routes keep their existing identity.
+        if route.lane == "request" and route.maximumRequestBytes < route.maximumPayloadBytes then
+            rows[#rows] ..= ":request=" .. tostring(route.maximumRequestBytes)
+        end
     end
     table.sort(rows)
     return table.freeze({

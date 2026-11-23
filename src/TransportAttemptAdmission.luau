@@ -1,5 +1,8 @@
 --!strict
 
+local Callbacks = if script
+    then require(script.Parent.TransportCallbacks)
+    else require("./TransportCallbacks")
 local AttemptAdmission = {}
 type Bucket = { packets: number, bytes: number, last: number }
 
@@ -40,7 +43,7 @@ function AttemptAdmission.new(options: any?): any
         packets = policy(settings.globalPackets, 8192, 4096),
         bytes = policy(settings.globalRawBytes, 8 * 1024 * 1024, 4 * 1024 * 1024),
     }
-    local ok, initial = pcall(clock)
+    local ok, initial = Callbacks.synchronous(clock)
     assert(ok and finite(initial), "attempt admission clock failed")
     local peers: { [any]: Bucket } = {}
     local global = {
@@ -52,11 +55,21 @@ function AttemptAdmission.new(options: any?): any
     local admission = {}
 
     function admission:admit(peer: any, rawBytes: any): (boolean, string?)
-        if closed or peer == nil or not finite(rawBytes) or rawBytes < 0 then
+        if
+            closed
+            or peer == nil
+            or peer ~= peer
+            or not finite(rawBytes)
+            or rawBytes < 0
+            or rawBytes ~= math.floor(rawBytes)
+        then
             return false, if closed then "closed" else "invalid_admission"
         end
 
-        local called, now = pcall(clock)
+        local called, now = Callbacks.synchronous(clock)
+        if closed then
+            return false, "closed"
+        end
 
         if not called or not finite(now) then
             return false, "invalid_admission"

@@ -40,7 +40,209 @@ local function bytes(text)
     return out
 end
 
+local function testQueuedViewerPermissions()
+    local viewers = { { UserId = 1 }, { UserId = 2 } }
+    local permitted = { [viewers[1]] = true, [viewers[2]] = true }
+    local deliveries = { [viewers[1]] = {}, [viewers[2]] = {} }
+    local reliable = { OnServerEvent = signal() }
+    function reliable:FireClient(viewer, frame)
+        local decoded = assert(Transport.Frame.decode(frame))
+        table.insert(deliveries[viewer], { buffer.tostring(decoded.payload), decoded.sequence })
+    end
+
+    local handshake = { OnServerEvent = signal() }
+    function handshake:FireClient() end
+    local heartbeat = signal()
+    local routes = { { id = 1, lane = "bulk", maximumFrameBytes = 256, maximumPayloadBytes = 128 } }
+    local manifest = assert(Transport.Manifest.build(routes))
+    local server = Transport.Remote.server(reliable, nil, function()
+        return {
+            routes = routes,
+            egress = {},
+            clock = function()
+                return 0
+            end,
+        }
+    end, { handshakeRemote = handshake, manifest = manifest, stepSignal = heartbeat })
+
+    for _, viewer in viewers do
+        local challenge = viewer.UserId
+        handshake.OnServerEvent:Fire(viewer, challenge, manifest.version, manifest.fingerprint)
+        handshake.OnServerEvent:Fire(
+            viewer,
+            challenge,
+            manifest.version,
+            manifest.fingerprint,
+            "ready"
+        )
+        local peer = assert(server:findPeer(viewer))
+        assert(peer:send(1, bytes("private"), nil, function()
+            return permitted[viewer]
+        end))
+        assert(peer:send(1, bytes("public")))
+    end
+    permitted[viewers[1]] = false
+    heartbeat:Fire()
+
+    local revoked = deliveries[viewers[1]]
+    local allowed = deliveries[viewers[2]]
+    assert(
+        #revoked == 1 and revoked[1][1] == "public" and revoked[1][2] == 1,
+        "a connected viewer who lost access must receive only the public frame at sequence one"
+    )
+    assert(
+        #allowed == 2
+            and allowed[1][1] == "private"
+            and allowed[1][2] == 1
+            and allowed[2][1] == "public"
+            and allowed[2][2] == 2,
+        "the other viewer must receive both frames in order"
+    )
+    server:destroy()
+end
+
+local function testSharedEgress(itemCap, byteCap, framesPerTurn)
+    local now, queuedReceives, timeouts = 0, 0, 0
+    local heartbeat = signal()
+    local reliable = { OnServerEvent = signal() }
+    local handshake = { OnServerEvent = signal() }
+    function handshake:FireClient() end
+    local routes =
+        { { id = 1, lane = "bulk" }, { id = 2, lane = "request" }, { id = 3, lane = "reliable" } }
+    local manifest = assert(Transport.Manifest.build(routes))
+    local sequences = {}
+    local frames = 0
+    function reliable:FireClient(player, frame)
+        local meta = assert(Transport.Frame.inspect(frame))
+        if meta.route == 1 then
+            frames += 1
+            sequences[player] += 1
+            assert(
+                meta.sequence == sequences[player],
+                "queued reliable sequence must stay contiguous"
+            )
+        end
+    end
+    local server = Transport.Remote.server(reliable, nil, function()
+        return {
+            routes = routes,
+            egress = { maximumAgeSeconds = 10 },
+            maximumReceiveFramesPerStep = 1,
+            clock = function()
+                return now
+            end,
+        }
+    end, {
+        handshakeRemote = handshake,
+        manifest = manifest,
+        stepSignal = heartbeat,
+        maximumEgressItemsPerStep = itemCap,
+        maximumEgressBytesPerStep = byteCap,
+    })
+    local players = {}
+    for i = 1, 6 do
+        local player = { UserId = i }
+        players[i] = player
+        sequences[player] = 0
+        handshake.OnServerEvent:Fire(player, i, manifest.version, manifest.fingerprint)
+        handshake.OnServerEvent:Fire(player, i, manifest.version, manifest.fingerprint, "ready")
+        local peer = assert(server:findPeer(player))
+        if byteCap == 29 then
+            local accepted, reason = peer:send(1, bytes("xx"))
+            assert(
+                not accepted and reason == "egress_capacity",
+                "an item that cannot fit must reject at admission"
+            )
+        end
+        for _ = 1, 4 do
+            assert(peer:send(1, bytes("x")))
+        end
+        assert(peer:request(2, bytes("r"), 0.1, function(ok, _, reason)
+            if not ok and reason == "timeout" then
+                timeouts += 1
+            end
+        end))
+        peer:on(3, function()
+            queuedReceives += 1
+        end)
+        for seq = 1, 2 do
+            reliable.OnServerEvent:Fire(
+                player,
+                assert(Transport.Frame.encode({
+                    epoch = peer.epoch,
+                    sequence = seq,
+                    route = 3,
+                    lane = "reliable",
+                    payload = bytes("r"),
+                }))
+            )
+        end
+    end
+    assert(queuedReceives == 6, "each peer must receive its first frame before the heartbeat")
+    now = 1
+    for step = 1, 24 / framesPerTurn do
+        local before = frames
+        heartbeat:Fire()
+        assert(
+            frames - before == framesPerTurn,
+            `server scheduled {frames - before} frames, expected {framesPerTurn}`
+        )
+        if step == 1 then
+            assert(
+                queuedReceives == 12 and timeouts == 6,
+                "send budgets must not block ingress or timeout settlement"
+            )
+            for _, player in players do
+                server:findPeer(player):step()
+            end
+            assert(
+                frames - before == framesPerTurn,
+                "direct peer steps must share the adapter's budget"
+            )
+        end
+        if step == 6 / framesPerTurn then
+            for _, player in players do
+                assert(sequences[player] == 1, "a waiting peer missed its turn")
+            end
+        end
+    end
+    for _, player in players do
+        assert(sequences[player] == 4, "each peer must receive all four queued bulk frames")
+    end
+    server:destroy()
+end
+
 return function()
+    testSharedEgress(2, 4096, 2)
+    testSharedEgress(8, 29, 1)
+    do
+        local routes = { { id = 1, lane = "reliable" } }
+        local manifest = assert(Transport.Manifest.build(routes))
+        local player = { UserId = 1 }
+        local handshake = { OnServerEvent = signal() }
+        local offers = 0
+        function handshake:FireClient()
+            offers += 1
+        end
+        local now = 0
+        local server = Transport.Remote.server({ OnServerEvent = signal() }, nil, function()
+            return { routes = routes }
+        end, {
+            handshakeRemote = handshake,
+            manifest = manifest,
+            clock = function()
+                return now
+            end,
+        })
+        now = math.huge
+        handshake.OnServerEvent:Fire(player, 1, manifest.version, manifest.fingerprint)
+        assert(offers == 0, "a failed clock sample must not open a handshake window")
+        now = 0
+        handshake.OnServerEvent:Fire(player, 1, manifest.version, manifest.fingerprint)
+        assert(offers == 1, "a valid clock must allow the next handshake")
+        server:destroy()
+    end
+    testQueuedViewerPermissions()
     local player = { UserId = 77 }
     local reliable = { OnClientEvent = signal(), OnServerEvent = signal() }
     function reliable:FireServer(frame)

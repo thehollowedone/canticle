@@ -6,7 +6,162 @@ local function bytes(text)
     return out
 end
 
+local function testAttemptAdmission()
+    local calls, seen = 0, {}
+    local function create(attempt, limit)
+        return Transport.Peer.new({
+            epoch = 7,
+            routes = {
+                { id = 1, lane = "reliable", maximumFrameBytes = 128, maximumPayloadBytes = 64 },
+            },
+            clock = function()
+                return 0
+            end,
+            ingressPackets = { capacity = limit or 8, refillPerSecond = 0 },
+            ingressReliableReserve = 0,
+            sendReliable = function() end,
+            attempt = attempt,
+        })
+    end
+    local function frame(sequence)
+        return assert(Transport.Frame.encode({
+            lane = "reliable",
+            route = 1,
+            epoch = 7,
+            sequence = sequence,
+            payload = bytes("abc"),
+        }))
+    end
+    local first = frame(1)
+    local peer = create(function(raw, carrier)
+        calls += 1
+        table.insert(seen, { raw, carrier })
+        if carrier == "unreliable" then
+            return false, "attempt_peer_raw_bytes"
+        end
+        return true
+    end, 4)
+    local delivered = {}
+    peer:on(1, function(_, meta)
+        table.insert(delivered, meta.sequence)
+    end)
+    local allowed, reason = peer:receive(nil, "unreliable")
+    assert(
+        not allowed and reason == "attempt_peer_raw_bytes" and seen[1][1] == 0,
+        "the attempt gate must receive zero bytes for a non-buffer"
+    )
+    allowed, reason = peer:receive(buffer.create(2048), "unreliable")
+    assert(
+        not allowed and reason == "attempt_peer_raw_bytes" and seen[2][1] == 2048,
+        "the attempt gate must see the full oversized wire buffer"
+    )
+    assert(
+        not peer:status().destroyed and peer:status().queuedFrames == 0,
+        "denied unreliable attempts must leave the peer open and its queue empty"
+    )
+    assert(
+        peer:receive(first) and peer:receive(frame(2), "reliable"),
+        "both reliable frames must be accepted after the unreliable denials"
+    )
+    assert(
+        seen[3][1] == buffer.len(first) and seen[3][2] == "reliable" and seen[1][2] == "unreliable",
+        "the gate must see the complete frame length and the normalized physical carrier"
+    )
+    assert(
+        #delivered == 2 and delivered[1] == 1 and delivered[2] == 2,
+        "reliable listeners must observe both sequences exactly once in order"
+    )
+    allowed, reason = peer:receive(frame(3))
+    assert(
+        not allowed and reason == "ingress_packets" and calls == 4,
+        "local packet budget runs first"
+    )
+
+    for _, case in
+        {
+            {
+                function()
+                    return false, "attempt_global_packets"
+                end,
+                "attempt_global_packets",
+            },
+            {
+                function()
+                    return false
+                end,
+                "limited",
+            },
+            {
+                function()
+                    return "yes"
+                end,
+                "attempt_admission_failed",
+            },
+            {
+                function()
+                    error("gate failure")
+                end,
+                "attempt_admission_failed",
+            },
+        }
+    do
+        local denied = create(case[1])
+        allowed, reason = denied:receive(first)
+        local status = denied:status()
+        assert(
+            not allowed and reason == case[2] and status.terminalReason == case[2],
+            "a denied reliable attempt must report the terminal reason " .. case[2]
+        )
+        assert(
+            status.receivedReliableSequence == 0 and status.queuedFrames == 0,
+            "a denied reliable frame must neither advance the cursor nor enter the receive queue"
+        )
+    end
+    local suspended
+    local yielding = create(function()
+        suspended = coroutine.running()
+        coroutine.yield()
+        return true
+    end)
+    allowed, reason = yielding:receive(first, "unreliable")
+    assert(
+        not allowed
+            and reason == "attempt_admission_failed"
+            and coroutine.status(suspended) == "dead",
+        "a yielding attempt must be rejected and its suspended callback released"
+    )
+    assert(
+        not yielding:status().destroyed,
+        "a yielding gate on an unreliable frame must leave the peer open"
+    )
+    yielding:destroy()
+
+    local reentrant
+    reentrant = create(function()
+        local nested, why = reentrant:receive(first)
+        assert(
+            not nested and why == "attempt_admission_failed",
+            "a recursive reliable receive must fail the active attempt gate"
+        )
+        return true
+    end)
+    allowed, reason = reentrant:receive(first)
+    assert(
+        not allowed and reason == "destroyed" and reentrant:status().receivedReliableSequence == 0,
+        "closing the peer during a nested receive must abandon the outer reliable frame"
+    )
+    assert(not pcall(create, "typo"), "invalid configuration must not silently disable admission")
+    local plain = create(nil)
+    allowed, reason = plain:receive(nil, "unreliable")
+    assert(
+        not allowed and reason == "frame_must_be_buffer" and plain:receive(first),
+        "an unconfigured peer must retain normal frame validation and accept its next valid frame"
+    )
+    plain:destroy()
+end
+
 return function()
+    testAttemptAdmission()
     local now = 0
     local sent = {}
     local metrics = Transport.Metrics.new()

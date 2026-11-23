@@ -6,7 +6,97 @@ local function bytes(text)
     return value
 end
 
+local function testOutboundPayloadLimit()
+    local packedSize = 4
+    local adapter = {
+        identity = "fixture",
+        version = 1,
+        compress = function(data)
+            local packed = buffer.create(packedSize)
+            buffer.writeu8(packed, 0, buffer.len(data))
+            return packed
+        end,
+        decompressedSize = function(data)
+            return buffer.readu8(data, 0)
+        end,
+        decompress = function(data)
+            return buffer.create(buffer.readu8(data, 0))
+        end,
+    }
+    local routes = {
+        {
+            id = 1,
+            lane = "reliable",
+            maximumFrameBytes = 64,
+            maximumPayloadBytes = 4,
+            maximumExpandedBytes = 32,
+            allowOutboundCompression = true,
+            compressionCodec = adapter.identity,
+            compressionVersion = adapter.version,
+            compressionPolicy = {
+                minimumBytes = 8,
+                minimumSavingsBytes = 0,
+                minimumSavingsRatio = 0,
+                metadataBytes = 0,
+            },
+        },
+    }
+    local receiver = Transport.Peer.new({
+        epoch = 1,
+        routes = routes,
+        compressor = adapter,
+        sendReliable = function() end,
+    })
+    local delivered = {}
+    receiver:on(1, function(payload)
+        table.insert(delivered, buffer.len(payload))
+    end)
+    local wire = {}
+    local sender = Transport.Peer.new({
+        epoch = 1,
+        routes = routes,
+        compressor = adapter,
+        permitOutboundCompression = true,
+        sendReliable = function(frame)
+            table.insert(wire, assert(Transport.Frame.inspect(frame)).sequence)
+            assert(receiver:receive(frame, "reliable"))
+        end,
+    })
+    local function expectRefused(size)
+        local sent, reason = sender:send(1, buffer.create(size))
+        assert(not sent and reason == "payload_too_large", "over-limit payload reached the carrier")
+    end
+    assert(sender:send(1, buffer.create(4)))
+    expectRefused(5)
+    packedSize = 5
+    expectRefused(16)
+    packedSize = 4
+    assert(sender:send(1, buffer.create(16)))
+    assert(
+        table.concat(wire, ",") == "1,2" and table.concat(delivered, ",") == "4,16",
+        "accepted payloads must arrive intact with consecutive wire sequences"
+    )
+    sender:destroy()
+    receiver:destroy()
+end
+
+local function testBatchCountFitsHeader()
+    local empty = buffer.create(0)
+    local items = table.create(65535, empty)
+    local limits = { maximumItems = 65536 }
+    local encoded = assert(Transport.Frame.encodeBatch(items, limits))
+    assert(
+        buffer.readu16(encoded, 0) == 65535,
+        "the 16-bit header must preserve its largest representable batch count"
+    )
+    items[65536] = empty
+    local rejected, reason = Transport.Frame.encodeBatch(items, limits)
+    assert(not rejected and reason == "batch_item_count", "batch count must fit the 16-bit header")
+end
+
 return function()
+    testOutboundPayloadLimit()
+    testBatchCountFitsHeader()
     local Frame = Transport.Frame
     local Peer = Transport.Peer
     local Manifest = Transport.Manifest

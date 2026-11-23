@@ -16,7 +16,7 @@ separately.
 | Type | Fields |
 | --- | --- |
 | `boolean` | No additional fields. |
-| `number` | Optional `min`, `max`, and `encoding` (`f32` or default `f64`); values must be finite. |
+| `number` | Optional `min`, `max`, and `encoding` (`f32` or default `f64`). For `f32`, both the input and the rounded wire value must be finite and within bounds. |
 | `integer` | Required `min`, `max` within the supported 32-bit range; optional `encoding`: `auto`, `varint`, `u8`, `i8`, `u16`, `i16`, `u32`, `i32`. |
 | `string` | Required `maxLength`, optional `minLength`; lengths are bytes. |
 | `enum` | `values`: ordered, unique strings. |
@@ -24,6 +24,10 @@ separately.
 | `object` | Ordered `fields`: `{ name, schema, optional? }`. |
 
 Field order, bounds, and encoding affect compatibility. Optional fields use a presence bitmap. Decoders reject malformed, noncanonical, out-of-range, and trailing data.
+
+Enum labels and object field names containing any of `% , : { } | ? !` now have
+updated schema fingerprints. Rebuild both endpoints and regenerate specialized
+codecs together when upgrading schemas that use these characters.
 
 | Codec method | Result |
 | --- | --- |
@@ -107,6 +111,7 @@ Route lanes: `reliable`, `unreliable`, `request`, `bulk`. Relevant options:
 | `allowBatch`, `maximumBatchItems`, `maximumBatchItemBytes` | Batching on reliable/bulk routes; up to 1,024 items. |
 | `allowCompactBatch` | Requires `allowBatch` and a compact decoder listener. |
 | `maximumOutstandingRequests` | Per-request-route concurrency cap. |
+| `maximumRequestBytes` | Optional request payload cap in bytes. Defaults to `maximumPayloadBytes`. A tighter cap changes the route fingerprint. Responses keep the full payload allowance. |
 
 ## Channels
 
@@ -114,8 +119,8 @@ Route lanes: `reliable`, `unreliable`, `request`, `bulk`. Relevant options:
 
 | Method | Behavior |
 | --- | --- |
-| `send(value, latest?)` | Returns `ok, reason?`. On an unreliable route, `latest = true` enables replaceable coalescing through the peer's egress scheduler. |
-| `sendBatch(values, compact?)` | Returns `ok, reason?`. |
+| `send(value, latest?, canSend?)` | Returns `ok, reason?`. On an unreliable route, `latest = true` lets a newer update replace a queued one. |
+| `sendBatch(values, compact?, canSend?)` | Returns `ok, reason?`. A single permission check covers the entire batch. |
 | `on(callback, rejected?)` | Calls `callback(value, context)` on valid input; returns an unsubscribe function. |
 | `onBatch(callback)` | Calls `callback(values, context)`; returns an unsubscribe function. |
 | `request(value, timeout, callback)` | Returns `requestId?, reason?`; callback receives `ok, response?, reason?`. Requires a response codec. |
@@ -130,6 +135,41 @@ Bulk sends and `latest = true` require a peer egress configuration. Pass
 options to use the scheduler's defaults. `latest = true` is accepted only on
 unreliable routes.
 
+For private data, pass a server-side `canSend` function that reads the recipient's
+current permission for the data in this message. For example, an application with
+viewer-specific records can send a snapshot on a bulk channel this way.
+
+```lua
+local recordId = snapshot.id
+local ok, reason = channel:send(snapshot, nil, function()
+    return permissions:canView(player, recordId)
+end)
+```
+
+Canticle checks immediately before handing the frame to the transport. The
+function must finish synchronously and return `true` to release the frame.
+An immediate send returns `false, "send_withheld"` if the check refuses, errors,
+or yields.
+For queued sends, `true, "queued"` means the queue accepted the message. If
+permission is revoked before delivery, the sender withholds that frame. The
+receiver gets subsequent eligible bulk messages with consecutive sequence numbers. A replacement latest
+update carries its own check. When visibility differs across batch items,
+group items by permission or supply a check that covers every item.
+If a custom transport adapter buffers the frame again, it must check current
+permission when it releases that second queue.
+
+The scheduler measures each queued frame's age at delivery. Frames older than
+`egress.maximumAgeSeconds` expire. Expired latest updates are dropped and
+expired reliable bulk terminates the peer with `egress_expired`.
+
+`Remote.server` shares a queued-send allowance across its peers on each step.
+The lifecycle settings `maximumEgressItemsPerStep` and `maximumEgressBytesPerStep`
+default to 256 entries and 4 MiB. Each attempted queued entry uses its full wire
+size, including headers. Waiting peers take turns, and a frame too large for a
+whole step returns `egress_capacity` at enqueue. Receive work and request
+timeouts keep their own scheduling. Inspect `server:status().egressItemsRemaining`
+and `server:status().egressBytesRemaining` for the unused allowance in this step.
+
 A request listener receives its ID in `context.requestId`. Reply through
 `channel:respond(context.requestId, value)` using the response codec bound to
 that channel.
@@ -139,8 +179,8 @@ that channel.
 `Peer.new(options)` requires `epoch`, `routes`, and `sendReliable`; add `sendUnreliable` for unreliable routes. Raw payload methods accept buffers:
 
 - `on(route, callback)`, `onCancel(route, callback)`: unsubscribe functions.
-- `send(route, payload, latest?)`, `sendBatch(route, buffers)`: `ok, reason?`.
-- `onBatchValues(route, codec, callback)`, `sendBatchValues(route, codec, values)`, `sendCompactBatchValues(route, codec, values)`.
+- `send(route, payload, latest?, canSend?)`, `sendBatch(route, buffers, canSend?)`: `ok, reason?`.
+- `onBatchValues(route, codec, callback)`, `sendBatchValues(route, codec, values, canSend?)`, `sendCompactBatchValues(route, codec, values, canSend?)`.
 - `request(route, payload, timeout, callback)`, `respond(route, requestId, payload)`, `cancel(route, requestId)`.
 - `receive(frame, carrier?)`, `step()`, `status()`, `destroy()`.
 
@@ -148,7 +188,9 @@ Call `step()` regularly to drain backlog and expire requests; call `destroy()` o
 
 Peer limits include `maximumOutstandingRequests`, `maximumRequestTimeout`, `maximumQueuedFrames`, `maximumQueuedReceiveBytes`, `ingressPackets`, and `maximumReceiveFramesPerStep` (default 32, maximum 256).
 
-The server adapter owns a shared `Admission` gate; configure budgets through `lifecycle.admission`. Raw peers can supply `admit(route, rawBytes, expandedBytes)` and an early `attempt` gate. `Admission`, `AttemptAdmission`, `Egress`, `Compression`, `Frame`, and `Metrics` are also exported for custom integrations.
+The server adapter owns a shared `Admission` gate configured through `lifecycle.admission`. Raw peers can supply `admit(route, rawBytes, expandedBytes)` for route-level admission. `Admission`, `AttemptAdmission`, `Egress`, `Compression`, `Frame`, and `Metrics` are exported for custom integrations.
+
+Raw peers may supply `attempt(rawBytes, carrier) -> (boolean, reason?)`. The per-peer packet bucket runs first. The synchronous callback then sees each buffer’s full wire length, including headers, and zero bytes for other inputs. The physical carrier is `unreliable` when explicitly supplied and `reliable` otherwise. Only `true` permits parsing or queuing. A denial, callback error, or yield drops unreliable traffic and retires a reliable peer before its wire sequence can develop a gap.
 
 Unreliable frames are capped at 1,000 bytes including headers; batching and compression are unsupported on this lane. Compression requires route opt-in, a versioned codec identity, and expanded-size limits. Request routes do not support compression. Raw and expanded sizes count toward admission before decompression.
 

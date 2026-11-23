@@ -35,6 +35,7 @@ local EGRESS_EVENTS = {
     emitted = true,
     rejected = true,
     expired = true,
+    withheld = true,
     failed = true,
 }
 local ADAPTER_EVENTS = {

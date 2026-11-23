@@ -5,7 +5,57 @@ local function nextRandom(state)
     return (state * 1664525 + 1013904223) % 4294967296
 end
 
+local function testFingerprintLabels()
+    local function enumFingerprint(first, second)
+        return assert(Codec.compile({ type = "enum", values = { first, second } })).fingerprint
+    end
+    local function objectFingerprint(first, second)
+        return assert(Codec.compile({
+            type = "object",
+            fields = {
+                { name = first, schema = { type = "boolean" } },
+                { name = second, schema = { type = "boolean" } },
+            },
+        })).fingerprint
+    end
+    assert(
+        enumFingerprint("A|B", "C") ~= enumFingerprint("A", "B|C"),
+        "enum identity must distinguish which label contains the separator"
+    )
+    assert(
+        enumFingerprint("A|B", "C") ~= enumFingerprint("A%7CB", "C"),
+        "a literal percent escape must retain its own enum identity"
+    )
+    assert(
+        objectFingerprint("a!b,b", "c") ~= objectFingerprint("a", "b!b,c"),
+        "field identity must preserve the boundary between field names"
+    )
+    assert(enumFingerprint("Ready", "Busy") == 3405451048, "ordinary enum identity changed")
+    assert(objectFingerprint("a", "b") == 1894657984, "ordinary field identity changed")
+end
+
+local function testFloat32Bounds()
+    local bounded =
+        assert(Codec.compile({ type = "number", encoding = "f32", min = -0.1, max = 0.1 }))
+    for _, value in { -0.1, 0.1 } do
+        local encoded, reason = bounded:encode(value)
+        assert(not encoded and reason == "invalid_number", "float32 rounds past declared bound")
+        assert(
+            not bounded:encodeBatch({ value }) and not bounded:encodeCompactBatch({ value }),
+            "both batch formats must reject a float32 that rounds outside the declared range"
+        )
+    end
+    assert(bounded:decode(assert(bounded:encode(0.0625))))
+    local wide = assert(Codec.compile({ type = "number", encoding = "f32" }))
+    assert(not wide:encode(1e100) and not wide:encode(-1e100), "finite f64 overflows f32")
+    assert(wide:decode(assert(wide:encode(2 ^ 127))))
+    local double = assert(Codec.compile({ type = "number" }))
+    assert(double:decode(assert(double:encode(1e100))), "f64 keeps its range")
+end
+
 return function()
+    testFloat32Bounds()
+    testFingerprintLabels()
     local codec = assert(
         Codec.compile({
             type = "object",

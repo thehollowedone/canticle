@@ -36,21 +36,29 @@ function Channel.bind(peer: any, routeId: number, codec: Codec, responseCodec: C
     end
 
     local handle = {}
-    function handle:send(value: any, latest: boolean?): (boolean, string?)
+    function handle:send(
+        value: any,
+        latest: boolean?,
+        canSend: (() -> boolean)?
+    ): (boolean, string?)
         local payload, reason = encode(codec, value)
 
         if not payload then
             return false, reason
         end
 
-        return peer:send(routeId, payload, latest)
+        return peer:send(routeId, payload, latest, canSend)
     end
-    function handle:sendBatch(values: any, compact: boolean?): (boolean, string?)
+    function handle:sendBatch(
+        values: any,
+        compact: boolean?,
+        canSend: (() -> boolean)?
+    ): (boolean, string?)
         if compact then
-            return peer:sendCompactBatchValues(routeId, codec, values)
+            return peer:sendCompactBatchValues(routeId, codec, values, canSend)
         end
 
-        return peer:sendBatchValues(routeId, codec, values)
+        return peer:sendBatchValues(routeId, codec, values, canSend)
     end
     function handle:on(callback: (any, any) -> (), rejected: ((any, any) -> ())?): () -> ()
         assert(

@@ -44,6 +44,11 @@ local function isBuffer(v: any): boolean
     return typeof(v) == "buffer"
 end
 
+-- Egress finalizes the sequence of an already encoded bulk frame at handoff.
+function TransportFrame.writeSequence(frame: buffer, sequence: number)
+    buffer.writeu32(frame, 12, sequence)
+end
+
 function TransportFrame.encode(meta: any): (buffer?, string?)
     if type(meta) ~= "table" or not isBuffer(meta.payload) then
         return nil, "invalid_frame"
@@ -125,7 +130,7 @@ function TransportFrame.encode(meta: any): (buffer?, string?)
     buffer.writeu8(out, 5, 0)
     buffer.writeu16(out, 6, meta.route)
     buffer.writeu32(out, 8, meta.epoch)
-    buffer.writeu32(out, 12, meta.sequence)
+    TransportFrame.writeSequence(out, meta.sequence)
     buffer.writeu32(out, 16, requestId)
     buffer.writeu32(out, 20, length)
     buffer.writeu32(out, 24, expanded)
@@ -274,7 +279,7 @@ function TransportFrame.encodeBatch(items: any, limits: BatchLimits?): (buffer?,
     local maxPayload = if limits and limits.maximumPayloadBytes
         then limits.maximumPayloadBytes
         else 1024 * 1024
-    if #items < 1 or #items > maxItems then
+    if #items < 1 or #items > maxItems or #items > 65535 then
         return nil, "batch_item_count"
     end
 
