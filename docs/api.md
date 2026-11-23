@@ -31,16 +31,13 @@ separately.
 Object fields and enum values must be dense lists indexed from one. A negative
 integer minimum and a maximum above 2,147,483,647 cannot fit the same supported
 encoding. Compilation rejects these declarations before a codec can be used.
-Existing valid schemas keep their fingerprints and wire layouts.
 
-Field order, bounds, and encoding affect compatibility. Optional fields use a
+Field order, bounds and encoding affect compatibility. Canticle escapes `%`,
+`,`, `:`, `{`, `}`, `|`, `?` and `!` in enum labels and object field names
+when computing the schema fingerprint. Optional fields use a
 presence bitmap in declaration order, starting at the low bit. Unused high bits
 in the final byte must be zero. Decoders reject malformed, noncanonical,
 out-of-range, and trailing data.
-
-Enum labels and object field names containing any of `% , : { } | ? !` now have
-updated schema fingerprints. Rebuild both endpoints and regenerate specialized
-codecs together when upgrading schemas that use these characters.
 
 | Codec method | Result |
 | --- | --- |
@@ -140,8 +137,10 @@ Route lanes: `reliable`, `unreliable`, `request`, `bulk`. Relevant options:
 | `respond(requestId, value)` | Returns `ok, reason?`; requires a response codec. |
 | `cancel(requestId)` | Returns `ok, reason?`. |
 
-Malformed single values reach the optional rejection callback. Route fingerprints
-detect codec mismatches during setup and batch sending.
+Malformed single values reach the optional rejection callback. Set
+`schemaFingerprint` on the route to have Canticle check the bound event or request
+codec. Set `responseFingerprint` to check a request route’s response codec.
+Both peers include the configured fingerprints in their handshake manifests.
 
 Bulk sends and `latest = true` require a peer egress configuration. Pass
 `egress = {}` in the client options, server peer factory result or raw peer
@@ -218,18 +217,34 @@ Unreliable frames are capped at 1,000 bytes including headers; batching and comp
 
 ## Generated batch codecs
 
-From a source checkout:
+The generator supports packed Boolean arrays and arrays of records with 1–16
+required unsigned byte fields. For example, save this packed Boolean array
+schema as `schema.json` in the Canticle checkout.
+
+```json
+{
+  "type": "array",
+  "encoding": "packed",
+  "maxLength": 64,
+  "items": { "type": "boolean" }
+}
+```
+
+Run the generator from the checkout to write both modules into `generated/`.
 
 ```powershell
 lune run tools/generate-codec.luau -- schema.json generated
 ```
 
-Supported schemas: packed Boolean arrays or arrays of records with 1–16 required unsigned byte fields. Output:
+The two modules expose the following methods and metadata.
 
 - `Client.luau`: checked `encodeBatch`, `encodeCompactBatch`, `fingerprint`, `maximumBytes`, `maximumDecodedValues`, `validatesOutgoing`.
 - `Server.luau`: bounded `decodeBatch`, `decodeCompactBatch`, `fingerprint`, `maximumBytes`, `maximumDecodedValues`.
 
-Use the encoder with batch sends and the decoder with `onBatchValues`; single values use the runtime codec. Keep server decoders in ServerScriptService. The separate `generate-client-codec.luau` and `generate-native-codec.luau` tools accept a schema path and an output file.
+Generate both modules from the same schema and Canticle revision. On a route
+with `allowBatch = true`, pass the client encoder to `peer:sendBatchValues` and
+register the server decoder with `peer:onBatchValues`. Use the runtime codec
+for single values. Keep server decoders in ServerScriptService. The separate `generate-client-codec.luau` and `generate-native-codec.luau` tools accept a schema path and an output file.
 
 Optional `--trust-outbound` skips outgoing primitive checks. Structural/allocation limits and server validation remain active; invalid local primitives may be coerced or throw. Generated modules request native compilation with ordinary Luau fallback. Batch memoization is scoped to one call and disabled for metatable-bearing inputs.
 
@@ -251,8 +266,7 @@ Terminal control messages use the existing handshake remote. The server sends
 at most three notifications per terminal session, at least 0.5 seconds apart,
 from heartbeat stepping or validated handshake traffic. Delivery is best effort:
 if all notifications are lost, an application timeout and explicit reconnect are
-still needed. Update client and server together. Old clients do not understand
-terminal notifications.
+still needed.
 
 Request settlement, metrics, and terminal callbacks must not yield; yielding
 callbacks are cancelled. Teardown releases retained state before notifying the
