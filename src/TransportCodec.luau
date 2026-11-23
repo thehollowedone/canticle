@@ -113,6 +113,9 @@ local function normalizeIntegerEncoding(
     minimum: number,
     maximum: number
 ): (string?, string?)
+    if minimum < 0 and maximum > I32_MAX then
+        return nil, "integer encoding cannot represent declared range"
+    end
     local encoding = spec.encoding or "auto"
 
     if encoding == "auto" then
@@ -153,6 +156,25 @@ local function signatureLabel(value: string): string
         return string.format("%%%02X", string.byte(delimiter))
     end)
     return escaped
+end
+
+-- Schema declarations must have exactly the indices that ipairs will compile.
+local function schemaList(value: any, minimum: number, maximum: number): boolean
+    if type(value) ~= "table" then
+        return false
+    end
+    local length = #value
+    if length < minimum or length > maximum then
+        return false
+    end
+    local count = 0
+    for key in next, value do
+        if type(key) ~= "number" or key < 1 or key > length or key ~= math.floor(key) then
+            return false
+        end
+        count += 1
+    end
+    return count == length
 end
 
 local function compile(rawSpec: any, depth: number): (Node?, string?)
@@ -264,7 +286,7 @@ local function compile(rawSpec: any, depth: number): (Node?, string?)
     elseif kind == "enum" then
         local values = spec.values
 
-        if type(values) ~= "table" or #values < 1 or #values > 256 then
+        if not schemaList(values, 1, 256) then
             return nil, "invalid_enum"
         end
 
@@ -351,7 +373,7 @@ local function compile(rawSpec: any, depth: number): (Node?, string?)
     elseif kind == "object" then
         local fields = spec.fields
 
-        if type(fields) ~= "table" or #fields > MAX_FIELDS then
+        if not schemaList(fields, 0, MAX_FIELDS) then
             return nil, "invalid_object_fields"
         end
 

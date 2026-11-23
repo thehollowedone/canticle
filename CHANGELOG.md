@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Preserve request limits and settlement during reentrant callbacks. Disconnecting an old listener leaves its replacement active, including when both registrations use the same function.
+- Reject integer schemas whose endpoints require different 32-bit representations. Reject gaps and named keys in object-field and enum declarations before they can silently drop values.
 - Reject nonzero unused bits in an object's optional-field bitmap on single and batch reads. Existing Canticle encoders already emit zero padding.
 - Reduce per-field work in generated checked byte-record encoders. Regenerate existing client modules to pick up the change.
 - Remove three temporary tables from ordinary packet receives and skip the empty receive queue. Yielding listeners retain their resume values and reliable delivery order.

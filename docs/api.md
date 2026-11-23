@@ -28,6 +28,11 @@ separately.
 | `array` | `items`: schema; required `maxLength`, optional `minLength`. Boolean arrays may use `encoding = "packed"`. |
 | `object` | Ordered `fields`: `{ name, schema, optional? }`. |
 
+Object fields and enum values must be dense lists indexed from one. A negative
+integer minimum and a maximum above 2,147,483,647 cannot fit the same supported
+encoding. Compilation rejects these declarations before a codec can be used.
+Existing valid schemas keep their fingerprints and wire layouts.
+
 Field order, bounds, and encoding affect compatibility. Optional fields use a
 presence bitmap in declaration order, starting at the low bit. Unused high bits
 in the final byte must be zero. Decoders reject malformed, noncanonical,
@@ -191,6 +196,15 @@ that channel.
 - `onBatchValues(route, codec, callback)`, `sendBatchValues(route, codec, values, canSend?)`, `sendCompactBatchValues(route, codec, values, canSend?)`.
 - `request(route, payload, timeout, callback)`, `respond(route, requestId, payload)`, `cancel(route, requestId)`.
 - `receive(frame, carrier?)`, `step()`, `status()`, `destroy()`.
+
+Each unsubscribe function owns a single registration. Rebinding a route with the
+same callback gives it a new owner. An older unsubscribe leaves that binding active.
+
+Peer and per-route request limits apply when a request reserves its slot, including
+when a custom clock opens another request during admission. If an instrumentation
+callback settles the request before delivery, the sender returns
+`nil, "request_settled"` (or `nil, "destroyed"` on retirement). Its settlement
+callback has already run.
 
 Call `step()` regularly to drain backlog and expire requests; call `destroy()` on retirement. The remote adapter does both automatically.
 

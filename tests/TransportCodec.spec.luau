@@ -5,6 +5,42 @@ local function nextRandom(state)
     return (state * 1664525 + 1013904223) % 4294967296
 end
 
+local function testSchemaBoundaries()
+    -- Each accepted domain must fit one integer representation at both ends.
+    for _, minimum in { -2147483648, -1, 0, 1 } do
+        for _, maximum in { 2147483647, 2147483648, 4294967295 } do
+            local codec, reason = Codec.compile({ type = "integer", min = minimum, max = maximum })
+            if minimum < 0 and maximum >= 2147483648 then
+                assert(
+                    not codec and reason == "integer encoding cannot represent declared range",
+                    "auto accepted a domain crossing both signed and unsigned ranges"
+                )
+            else
+                assert(codec, "representable range must compile")
+                for _, value in { minimum, maximum } do
+                    local ok, decoded = codec:decode(assert(codec:encode(value)))
+                    assert(ok and decoded == value, "accepted integer boundary must round-trip")
+                end
+            end
+        end
+    end
+
+    local field = { name = "flag", schema = { type = "boolean" } }
+    for _, schema in
+        {
+            { type = "object", fields = { flag = field } },
+            { type = "object", fields = { field, [3] = field } },
+            { type = "enum", values = { "first", [3] = "third" } },
+            { type = "enum", values = { "first", extra = "second" } },
+        }
+    do
+        assert(not Codec.compile(schema), "schema list must not silently discard declarations")
+    end
+    assert(Codec.compile({ type = "object", fields = {} }), "empty object is valid")
+    local enum = assert(Codec.compile({ type = "enum", values = { "first", "second" } }))
+    assert(buffer.tostring(assert(enum:encode("second"))) == string.char(1), "ordered enum ordinal")
+end
+
 local function testFingerprintLabels()
     local function enumFingerprint(first, second)
         return assert(Codec.compile({ type = "enum", values = { first, second } })).fingerprint
@@ -122,6 +158,7 @@ local function testOptionalBitmap()
 end
 
 return function()
+    testSchemaBoundaries()
     testOptionalBitmap()
     testFloat32Bounds()
     testFingerprintLabels()

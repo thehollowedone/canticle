@@ -39,6 +39,7 @@ type Route = {
     compressionPolicy: any,
 }
 type PendingRequest = { route: number, deadline: number, callback: (...any) -> ...any }
+type Listener = { callback: (...any) -> ...any }
 type BatchListener = { codec: any, callback: (...any) -> ...any }
 type QueuedFrame = { raw: number, frame: buffer, carrier: string? }
 type PeerData = {
@@ -75,9 +76,9 @@ type PeerData = {
     requests: { [number]: PendingRequest? },
     requestCount: number,
     routeRequests: { [number]: number? },
-    listeners: { [number]: (...any) -> ...any },
+    listeners: { [number]: Listener? },
     batchListeners: { [number]: BatchListener? },
-    cancelListeners: { [number]: (...any) -> ...any },
+    cancelListeners: { [number]: Listener? },
     sending: boolean,
     receiving: boolean,
     receiveOperation: any,
@@ -274,6 +275,15 @@ function Impl._drainReceiveQueue(self: PeerState, limit: number)
     return processed
 end
 
+local function bindListener<T>(listeners: { [number]: T? }, route: number, entry: T): () -> ()
+    listeners[route] = entry
+    return function()
+        if listeners[route] == entry then
+            listeners[route] = nil
+        end
+    end
+end
+
 function Impl.onCancel(self: PeerState, route: number, fn: any): () -> ()
     assert(
         not self.destroyed
@@ -282,26 +292,14 @@ function Impl.onCancel(self: PeerState, route: number, fn: any): () -> ()
             and type(fn) == "function",
         "invalid cancel listener"
     )
-    self.cancelListeners[route] = fn
-    local live = true
-    return function()
-        if live and self.cancelListeners[route] == fn then
-            self.cancelListeners[route] = nil
-        end
-        live = false
-    end
+    local entry: Listener = { callback = fn }
+    return bindListener(self.cancelListeners, route, entry)
 end
 
 function Impl.on(self: PeerState, route: number, fn: any): () -> ()
     assert(not self.destroyed and self.routes[route] and type(fn) == "function", "invalid listener")
-    self.listeners[route] = fn
-    local live = true
-    return function()
-        if live and self.listeners[route] == fn then
-            self.listeners[route] = nil
-        end
-        live = false
-    end
+    local entry: Listener = { callback = fn }
+    return bindListener(self.listeners, route, entry)
 end
 
 function Impl.onBatchValues(self: PeerState, route: number, codec: any, fn: any): () -> ()
@@ -318,15 +316,8 @@ function Impl.onBatchValues(self: PeerState, route: number, codec: any, fn: any)
             and type(fn) == "function",
         "invalid batch listener"
     )
-    local entry = { codec = codec, callback = fn }
-    self.batchListeners[route] = entry
-    local live = true
-    return function()
-        if live and self.batchListeners[route] == entry then
-            self.batchListeners[route] = nil
-        end
-        live = false
-    end
+    local entry: BatchListener = { codec = codec, callback = fn }
+    return bindListener(self.batchListeners, route, entry)
 end
 
 function Impl._finishRequest(
@@ -794,6 +785,12 @@ function Impl._nextRequest(self: PeerState): number?
     return nil
 end
 
+local function canOpenRequest(self: PeerState, route: Route): boolean
+    return not self.destroyed
+        and self.requestCount < self.maxRequests
+        and (self.routeRequests[route.id] or 0) < route.maximumOutstandingRequests
+end
+
 function Impl.request(
     self: PeerState,
     routeId: number,
@@ -802,28 +799,17 @@ function Impl.request(
     callback: any
 ): (number?, string?)
     local route = self.routes[routeId]
-    local routeCount = self.routeRequests[routeId] or 0
-
     if
-        self.destroyed
-        or not route
+        not route
         or route.lane ~= "request"
         or not finite(timeout)
         or timeout <= 0
         or timeout > self.maxTimeout
         or type(callback) ~= "function"
-        or self.requestCount >= self.maxRequests
-        or routeCount >= route.maximumOutstandingRequests
+        or not canOpenRequest(self, route)
     then
         metric(self, "denial", "request_capacity")
         return nil, "invalid_request"
-    end
-
-    local requestId = self:_nextRequest()
-
-    if not requestId then
-        metric(self, "denial", "request_capacity")
-        return nil, "request_capacity"
     end
 
     local ok, now = safe(self.clock)
@@ -831,18 +817,33 @@ function Impl.request(
     if not ok or not finite(now) then
         return nil, "clock_failed"
     end
-    self.requests[requestId] = {
+    -- An application clock may open another request or retire this peer.
+    if not canOpenRequest(self, route) then
+        metric(self, "denial", "request_capacity")
+        return nil, "invalid_request"
+    end
+    local requestId = self:_nextRequest()
+
+    if not requestId then
+        metric(self, "denial", "request_capacity")
+        return nil, "request_capacity"
+    end
+    local pending: PendingRequest = {
         route = routeId,
         deadline = now + timeout,
         callback = callback,
     }
+    self.requests[requestId] = pending
     self.requestCount += 1
-    self.routeRequests[routeId] = routeCount + 1
+    self.routeRequests[routeId] = (self.routeRequests[routeId] or 0) + 1
     metric(self, "request", "opened")
+    if self.requests[requestId] ~= pending then
+        return nil, if self.destroyed then "destroyed" else "request_settled"
+    end
     local sent, err = self:_send(route, "request", payload, requestId, false, false)
 
     if not sent then
-        if self.requests[requestId] then
+        if self.requests[requestId] == pending then
             self:_finishRequest(requestId, "cancelled", false, nil, err)
         end
 
@@ -1103,7 +1104,7 @@ function Impl._receiveNow(self: PeerState, frame: buffer, carrier: string?): (bo
         local cancelListener = self.cancelListeners[meta.route]
 
         if cancelListener then
-            local ok = safe(cancelListener, meta.requestId, {
+            local ok = safe(cancelListener.callback, meta.requestId, {
                 route = meta.route,
                 epoch = meta.epoch,
                 sequence = meta.sequence,
@@ -1116,13 +1117,13 @@ function Impl._receiveNow(self: PeerState, frame: buffer, carrier: string?): (bo
         return true, nil
     end
 
-    local listener = if batchListener then batchListener.callback else self.listeners[meta.route]
+    local listener = if batchListener then batchListener else self.listeners[meta.route]
 
     if not listener then
         return true, "no_listener"
     end
 
-    local ok = safe(listener, if batchListener then batchValues else payload, {
+    local ok = safe(listener.callback, if batchListener then batchValues else payload, {
         route = meta.route,
         lane = meta.lane,
         epoch = meta.epoch,

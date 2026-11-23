@@ -160,8 +160,135 @@ local function testAttemptAdmission()
     plain:destroy()
 end
 
+local function testRequestAdmissionCallbacks()
+    local empty = buffer.create(0)
+    -- Replaying seed 49173 minimized to arming a nested request and opening the outer one.
+    for _, limits in
+        {
+            { peer = 1, route = 2, innerRoute = 2, expected = 1 },
+            { peer = 2, route = 1, innerRoute = 1, expected = 1 },
+            { peer = 2, route = 2, innerRoute = 1, expected = 2 },
+        }
+    do
+        local peer, innerId
+        local sent, settlements = 0, 0
+        local armed = true
+        local function settled()
+            settlements += 1
+        end
+        peer = Transport.Peer.new({
+            epoch = 1,
+            maximumOutstandingRequests = limits.peer,
+            routes = {
+                { id = 1, lane = "request", maximumOutstandingRequests = limits.route },
+                { id = 2, lane = "request", maximumOutstandingRequests = limits.route },
+            },
+            clock = function()
+                if armed then
+                    armed = false
+                    innerId = peer:request(limits.innerRoute, empty, 1, settled)
+                end
+                return 0
+            end,
+            sendReliable = function()
+                sent += 1
+            end,
+        })
+        local outerId, reason = peer:request(1, empty, 1, settled)
+        assert(innerId ~= nil, "the nested request owns the first available slot")
+        assert(
+            peer:status().outstandingRequests == limits.expected and sent == limits.expected,
+            "a clock callback may consume the last peer or route request slot"
+        )
+        if limits.expected == 1 then
+            assert(outerId == nil and reason == "invalid_request", "the outer open must be refused")
+        else
+            assert(
+                outerId ~= nil and outerId ~= innerId,
+                "two available slots admit distinct requests"
+            )
+        end
+        peer:destroy()
+        assert(settlements == limits.expected, "only admitted requests receive settlement")
+    end
+
+    local peer
+    local now, sent, settled = 0, 0, 0
+    peer = Transport.Peer.new({
+        epoch = 1,
+        routes = { { id = 1, lane = "request" } },
+        clock = function()
+            return now
+        end,
+        sendReliable = function()
+            sent += 1
+        end,
+        metrics = {
+            request = function(_, event)
+                if event == "opened" then
+                    now += 1
+                    peer:step()
+                end
+            end,
+        },
+    })
+    local requestId, reason = peer:request(1, empty, 1, function(ok, _, failure)
+        assert(not ok and failure == "timeout", "the expired request must settle as a timeout")
+        settled += 1
+    end)
+    assert(sent == 0, "a request settled before handoff must never reach the carrier")
+    assert(
+        requestId == nil and reason == "request_settled",
+        "the caller must see the unsent request"
+    )
+    peer:destroy()
+    assert(settled == 1, "retirement must not settle the request again")
+end
+
+local function testListenerReplacement()
+    local receiver = Transport.Peer.new({
+        epoch = 1,
+        routes = { { id = 1, lane = "reliable" }, { id = 2, lane = "request" } },
+        sendReliable = function() end,
+    })
+    local sender = Transport.Peer.new({
+        epoch = 1,
+        routes = { { id = 1, lane = "reliable" }, { id = 2, lane = "request" } },
+        sendReliable = function(frame)
+            assert(receiver:receive(frame, "reliable"), "the control frame must be received")
+        end,
+    })
+    for _, method in { "on", "onCancel" } do
+        local route = if method == "on" then 1 else 2
+        local calls = 0
+        local function listener()
+            calls += 1
+        end
+        local function deliver()
+            if method == "on" then
+                assert(sender:send(route, bytes("data")), "the control event must send")
+            else
+                assert(sender:cancel(route, 1), "the control cancellation must send")
+            end
+        end
+        local old = receiver[method](receiver, route, listener)
+        local current = receiver[method](receiver, route, listener)
+        old()
+        old()
+        deliver()
+        assert(calls == 1, method .. " must preserve a newer binding of the same callback")
+        current()
+        deliver()
+        assert(calls == 1, method .. " must stop delivery after the current owner disconnects")
+    end
+    sender:destroy()
+    receiver:destroy()
+end
+
 return function()
     testAttemptAdmission()
+    testListenerReplacement()
+    testRequestAdmissionCallbacks()
     local now = 0
     local sent = {}
     local metrics = Transport.Metrics.new()
