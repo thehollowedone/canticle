@@ -1,9 +1,5 @@
 --!strict
 
-local Egress = if script
-    then require(script.Parent.TransportEgress)
-    else require("./TransportEgress")
-
 local Config = {}
 local U32 = 4294967295
 
@@ -348,6 +344,9 @@ function Config.peer(options: any): (any?, string?)
         refillPerSecond = ingressPacketRefill,
     })
     if options.egress ~= nil then
+        local Egress = if script
+            then require(script.Parent.TransportEgress)
+            else require("./TransportEgress")
         local egress, egressError = Egress.validate(options.egress)
 
         if not egress then

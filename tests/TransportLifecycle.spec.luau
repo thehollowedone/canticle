@@ -403,7 +403,11 @@ return function()
         local value = buffer.readstring(payload, 0, buffer.len(payload))
         table.insert(receiveOrder, value)
         if value == "first" then
-            coroutine.yield("receiving")
+            local args = table.pack(coroutine.yield("receiving", nil, 7))
+            assert(
+                args.n == 3 and args[1] == "continue" and args[2] == nil and args[3] == 8,
+                "the listener must receive every value sent back through the suspended caller"
+            )
         end
     end)
     local firstReceive = assert(
@@ -429,11 +433,22 @@ return function()
     local receiveThread = coroutine.create(function()
         return receivePeer:receive(firstReceive)
     end)
-    resumed, marker = coroutine.resume(receiveThread)
-    assert(resumed and marker == "receiving", "first listener must yield inside receive")
+    local waiting = table.pack(coroutine.resume(receiveThread))
+    assert(
+        waiting.n == 4
+            and waiting[1]
+            and waiting[2] == "receiving"
+            and waiting[3] == nil
+            and waiting[4] == 7,
+        "receive must forward all values from a yielding listener"
+    )
     local queued, queuedReason = receivePeer:receive(secondReceive)
     assert(queued and queuedReason == "queued", "concurrent receive must enter the bounded queue")
-    assert(coroutine.resume(receiveThread), "serialized receiver must resume")
+    local completed = table.pack(coroutine.resume(receiveThread, "continue", nil, 8))
+    assert(
+        completed.n == 3 and completed[1] and completed[2] == true and completed[3] == nil,
+        "resumed receive must return success and a nil reason"
+    )
     assert(
         receiveOrder[1] == "first" and receiveOrder[2] == "second",
         "yielding listeners must still execute in reliable sequence order"

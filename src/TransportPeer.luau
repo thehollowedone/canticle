@@ -358,15 +358,15 @@ function Impl._runReceive(self: PeerState, callback: () -> (boolean, string?)): 
         waiter = coroutine.running(),
         waiting = false,
         driving = true,
-        result = nil,
     }
     self.receiveOperation = operation
     self.receiving = true
-    local function complete(...)
-        if operation.result then
+    local function complete(accepted: boolean, reason: string?)
+        if operation.accepted ~= nil then
             return
         end
-        operation.result = table.pack(...)
+        operation.accepted = accepted
+        operation.reason = reason
         if self.receiveOperation == operation then
             self.receiveOperation = nil
             self.receiving = false
@@ -389,10 +389,10 @@ function Impl._runReceive(self: PeerState, callback: () -> (boolean, string?)): 
     end
     operation.complete = complete
     local worker = coroutine.create(function()
-        local result = table.pack(pcall(callback))
+        local called, accepted, reason = pcall(callback)
 
-        if result[1] then
-            complete(table.unpack(result, 2, result.n))
+        if called then
+            complete(accepted, reason)
         else
             self:_terminate("receive_failed")
         end
@@ -400,7 +400,7 @@ function Impl._runReceive(self: PeerState, callback: () -> (boolean, string?)): 
     operation.worker = worker
     local yielded = table.pack(coroutine.resume(worker))
     operation.driving = false
-    while not operation.result do
+    while operation.accepted == nil do
         if not yielded[1] then
             self:_terminate("receive_failed")
             break
@@ -408,7 +408,7 @@ function Impl._runReceive(self: PeerState, callback: () -> (boolean, string?)): 
         operation.waiting = true
         local resumed = table.pack(coroutine.yield(table.unpack(yielded, 2, yielded.n)))
         operation.waiting = false
-        if not operation.result then
+        if operation.accepted == nil then
             operation.driving = true
             yielded = table.pack(coroutine.resume(worker, table.unpack(resumed, 1, resumed.n)))
             operation.driving = false
@@ -420,7 +420,7 @@ function Impl._runReceive(self: PeerState, callback: () -> (boolean, string?)): 
         Callbacks.cancel(worker)
     end
 
-    return table.unpack(operation.result, 1, operation.result.n)
+    return operation.accepted, operation.reason
 end
 
 function Impl._terminate(self: PeerState, reason: string)
@@ -939,11 +939,7 @@ function Impl._receiveNow(self: PeerState, frame: buffer, carrier: string?): (bo
         return false, "frame_too_large"
     end
 
-    local meta, err = Frame.inspect(frame, {
-        maximumFrameBytes = self.maximumInboundFrameBytes,
-        maximumPayloadBytes = raw,
-        maximumExpandedBytes = U32,
-    })
+    local meta, err = Frame.inspect(frame)
     if not meta then
         return false, err
     end
@@ -1267,7 +1263,9 @@ function Impl.receive(self: PeerState, frame: any, carrier: string?): (boolean, 
         local called, accepted, reason = safe(self._receiveNow, self, frame, carrier)
         local firstAccepted = if called then accepted else false
         local firstReason = if called then reason else "receive_failed"
-        self:_drainReceiveQueue(math.max(0, self.maximumReceiveFramesPerStep - 1))
+        if self.receiveQueueHead <= self.receiveQueueTail then
+            self:_drainReceiveQueue(self.maximumReceiveFramesPerStep - 1)
+        end
         if not called then
             self:_terminate("receive_failed")
         end

@@ -97,17 +97,13 @@ function Generator.generate(spec, options)
         end
         for i, field in ipairs(fields) do
             add(`        local v{i}=item[{string.format("%q", field.name)}]`)
-            if checked then
-                add(`        if v{i}==nil then return nil,'missing_field' end`)
-            end
-
             local narrow = if field.schema.min ~= 0 or field.schema.max ~= 255
                 then ` or v{i}<{field.schema.min} or v{i}>{field.schema.max}`
                 else ""
             -- Equality with the masked byte rejects fractions and values outside 0..255.
             if checked then
                 add(
-                    `        if type(v{i})~='number' or bit32.band(v{i},255)~=v{i}{narrow} then return nil,'invalid_integer' end`
+                    `        if type(v{i})~='number' or bit32.band(v{i},255)~=v{i}{narrow} then return nil, if v{i}==nil then 'missing_field' else 'invalid_integer' end`
                 )
             end
         end

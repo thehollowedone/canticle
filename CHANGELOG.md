@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Reject nonzero unused bits in an object's optional-field bitmap on single and batch reads. Existing Canticle encoders already emit zero padding.
+- Reduce per-field work in generated checked byte-record encoders. Regenerate existing client modules to pick up the change.
+- Remove three temporary tables from ordinary packet receives and skip the empty receive queue. Yielding listeners retain their resume values and reliable delivery order.
+- Load the optional egress scheduler on demand when using standalone route or manifest configuration.
 - Check private event and batch permissions at delivery. Withheld bulk messages leave the next reliable sequence available. Each queued frame is checked against its own deadline.
 - Share the server’s per-step item and byte limits across peers with pending sends. Incoming frames and request deadlines continue to make progress when the send allowance runs out.
 - Enforce request-only byte limits on both peers, check encoded payload sizes before sending, and reject raw batch counts that exceed the 16-bit header.

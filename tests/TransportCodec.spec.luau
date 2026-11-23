@@ -53,7 +53,76 @@ local function testFloat32Bounds()
     assert(double:decode(assert(double:encode(1e100))), "f64 keeps its range")
 end
 
+local function testOptionalBitmap()
+    local minimal = assert(Codec.compile({
+        type = "object",
+        fields = { { name = "p", schema = { type = "boolean" }, optional = true } },
+    }))
+    -- With p absent the only canonical byte is 00. Bit 1 has no field.
+    assert(
+        not minimal:decode(buffer.fromstring("\2")),
+        "optional bitmap accepted a set padding bit"
+    )
+
+    local seed = 1847
+    for _, count in { 0, 1, 7, 8, 9, 15, 16, 17, 31, 32, 63 } do
+        local fields = { { name = "tag", schema = { type = "boolean" } } }
+        for i = 1, count do
+            fields[i + 1] = { name = tostring(i), schema = { type = "boolean" }, optional = true }
+        end
+        local codec = assert(Codec.compile({ type = "object", fields = fields }))
+        for sample = 1, 4 do
+            local bitmap = table.create(math.ceil(count / 8), 0)
+            local body = { "\1" } -- Required tag precedes the optional field values.
+            local value = { tag = true }
+            for i = 1, count do
+                seed = nextRandom(seed)
+                if sample == 1 or (sample > 2 and seed % 3 ~= 0) then
+                    local flag = seed % 2 == 0
+                    value[tostring(i)] = flag
+                    local byte = math.ceil(i / 8)
+                    bitmap[byte] += 2 ^ ((i - 1) % 8)
+                    table.insert(body, if flag then "\1" else "\0")
+                end
+            end
+            local payload = table.concat(body)
+            local wire = string.char(table.unpack(bitmap)) .. payload
+            assert(
+                buffer.tostring(assert(codec:encode(value))) == wire,
+                "optional bitmap wire layout"
+            )
+            for _, mode in { "decode", "decodeBatch", "decodeCompactBatch" } do
+                local function decode(item)
+                    local header = if mode == "decode"
+                        then ""
+                        elseif mode == "decodeBatch" then string.char(1, 0, #item, 0, 0, 0)
+                        else "\1\0"
+                    return codec[mode](codec, buffer.fromstring(header .. item))
+                end
+                local ok, decoded = decode(wire)
+                assert(ok, "canonical bitmap rejected in " .. mode)
+                local record = if mode == "decode" then decoded else decoded[1]
+                for _, field in ipairs(fields) do
+                    assert(
+                        record[field.name] == value[field.name],
+                        "wrong optional field in " .. mode
+                    )
+                end
+                local used = count % 8
+                if used ~= 0 then
+                    for bit = used, 7 do
+                        local last = bitmap[#bitmap] + 2 ^ bit
+                        local invalid = wire:sub(1, #bitmap - 1) .. string.char(last) .. payload
+                        assert(not decode(invalid), "optional bitmap padding accepted in " .. mode)
+                    end
+                end
+            end
+        end
+    end
+end
+
 return function()
+    testOptionalBitmap()
     testFloat32Bounds()
     testFingerprintLabels()
     local codec = assert(

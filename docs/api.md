@@ -1,6 +1,11 @@
 # API guide
 
-Require the Canticle package root. Compile schemas and routes once at startup; use the same protocol on both peers.
+The package root exposes the full transport API. For a narrower dependency,
+require the `TransportCodec`, `TransportConfig`, or `TransportManifest` child
+ModuleScript directly. The codec and route configuration each load a single
+module. Manifest creation also loads route configuration. Configuring a peer
+with `options.egress` loads the scheduler. Compile schemas and routes once at
+startup and use the same protocol on both peers.
 
 ## Schemas
 
@@ -23,7 +28,10 @@ separately.
 | `array` | `items`: schema; required `maxLength`, optional `minLength`. Boolean arrays may use `encoding = "packed"`. |
 | `object` | Ordered `fields`: `{ name, schema, optional? }`. |
 
-Field order, bounds, and encoding affect compatibility. Optional fields use a presence bitmap. Decoders reject malformed, noncanonical, out-of-range, and trailing data.
+Field order, bounds, and encoding affect compatibility. Optional fields use a
+presence bitmap in declaration order, starting at the low bit. Unused high bits
+in the final byte must be zero. Decoders reject malformed, noncanonical,
+out-of-range, and trailing data.
 
 Enum labels and object field names containing any of `% , : { } | ? !` now have
 updated schema fingerprints. Rebuild both endpoints and regenerate specialized

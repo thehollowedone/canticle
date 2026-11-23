@@ -107,17 +107,31 @@ local function run()
                     codec:encodeCompactBatch({ { invalid, row } }) == nil,
                     "runtime ranges/types reject"
                 )
+                local encoded, reason = generated:encodeCompactBatch({ { invalid, row } })
                 assert(
-                    generated:encodeCompactBatch({ { invalid, row } }) == nil,
-                    "generated ranges/types reject"
+                    encoded == nil and reason == "invalid_integer",
+                    "invalid fields must identify the integer error"
                 )
             end
 
-            local missing = table.clone(row)
-            missing[fields[1].name] = nil
+            local stopAt = math.min(2, width)
+            local reads = {}
+            local missing = setmetatable({}, {
+                __index = function(_, name)
+                    table.insert(reads, name)
+                    return if name == fields[stopAt].name then nil else row[name]
+                end,
+            })
+            local result, reason = generated:encodeCompactBatch({ { missing, row } })
             assert(
-                generated:encodeCompactBatch({ { missing, row } }) == nil,
-                "required fields reject"
+                result == nil and reason == "missing_field",
+                "missing required fields must retain their diagnostic"
+            )
+            assert(
+                #reads == stopAt
+                    and reads[1] == fields[1].name
+                    and reads[stopAt] == fields[stopAt].name,
+                "checked writes must read each field once in schema order and stop on the first error"
             )
             local before = assert(generated:encodeCompactBatch({ one, one }))
             row[fields[1].name] = if row[fields[1].name] == 1 then 2 else 1

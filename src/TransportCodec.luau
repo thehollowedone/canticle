@@ -402,6 +402,7 @@ local function compile(rawSpec: any, depth: number): (Node?, string?)
         end
 
         local bitmapBytes = math.ceil(optionalCount / 8)
+        local tailBits = optionalCount % 8
         maximumBytes += bitmapBytes
         if maximumBytes > MAX_BYTES then
             return nil, "schema_too_large"
@@ -411,6 +412,7 @@ local function compile(rawSpec: any, depth: number): (Node?, string?)
             kind = kind,
             fields = out,
             bitmapBytes = bitmapBytes,
+            bitmapTailLimit = if tailBits > 0 then 2 ^ tailBits else nil,
             maximumValues = maximumValues,
             maximumBytes = maximumBytes,
             signature = kind .. "{" .. table.concat(signatures, ",") .. "}",
@@ -886,6 +888,12 @@ local function readNode(node: Node, reader: Reader): (any?, string?)
 
         local bitmapStart = reader.offset
         reader.offset += node.bitmapBytes
+        if
+            node.bitmapTailLimit
+            and buffer.readu8(reader.data, reader.offset - 1) >= node.bitmapTailLimit
+        then
+            return nil, "noncanonical_object_bitmap"
+        end
         local out = {}
 
         for _, field in ipairs(node.fields) do

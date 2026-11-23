@@ -31,6 +31,13 @@ resulting ModuleScript:
 local Canticle = require(game:GetService("ReplicatedStorage").Packages.Canticle)
 ```
 
+For a script that only serializes values, require the codec directly. This loads
+one ModuleScript and exposes the same `compile` function as `Canticle.Codec`.
+
+```lua
+local Codec = require(game:GetService("ReplicatedStorage").Packages.Canticle.TransportCodec)
+```
+
 ## Use
 
 ```lua
